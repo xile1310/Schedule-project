@@ -1,0 +1,42 @@
+What this project does
+
+This project is a timetabling prototype that reads scheduling inputs from Excel workbooks and automatically generates a feasible class timetable. It assigns each teaching session (lectures, tutorials, labs, workshops, etc.) to a day, start time, and room while respecting hard constraints (no double bookings for rooms, tutors or student groups; room capacity and type; online vs face-to-face room rules; valid teaching weeks) and optimising soft goals (minimising tutor idle gaps, avoiding online↔f2f switches, limiting long consecutive blocks for students, and grouping online sessions into preferred days).
+
+The tool produces machine-readable output (a canonical `timetable.json`), an interactive single-file HTML dashboard for visual review, and Excel outputs (detailed workbook, a simple results sheet, and optionally a populated institutional template). The solver uses OR-Tools CP-SAT when available and falls back to a pure-Python greedy+local-search heuristic otherwise.
+
+
+Application workflow (input → output)
+
+1. Input discovery
+   - The CLI entry point (`run.py`) locates input workbooks. It accepts either a SIT-style worksheet (e.g., `Timetable.xlsx`) or a single consolidated `inputs.xlsx` containing tabs for Modules, Tutors, Rooms, Calendar, and Settings. If no explicit files are passed, the script auto-detects known filenames in the project root.
+
+2. Data loading & normalization
+   - `data_loader` parses the spreadsheets into in-memory domain objects defined in `models.py`: `Course`, `Activity` (one teaching event), `Group` (student subgroups), `Room`, `Tutor`, `TimeSlot`, and `Calendar`.
+   - It applies workbook `Settings` (overrides for day start/end, slot length, group caps, canonical period starts) and constructs the slot grid (30-minute units by default).
+   - Free-text `Remarks` are parsed opportunistically to pin a session to a day/time when possible; groups are synthesized/split based on capacity rules.
+
+3. Build the scheduling universe
+   - The loader returns a `Universe` object containing all activities, rooms, tutors, groups, timeslots, and calendar weeks. A synthetic large-capacity `VIRTUAL` room is added for online sessions.
+
+4. Solver selection and scheduling
+   - `run.py` selects `cp-sat` if `ortools` is importable, otherwise the heuristic solver.
+   - Each solver computes an assignment for every `Activity` as `(day, start_index, room)`:
+       - `solver_cpsat.py`: Models integer variables for day/start/room, encodes pairwise and resource constraints (H1–H8) and optional soft terms into an objective, then invokes CP‑SAT to optimise.
+       - `solver_heuristic.py`: Orders activities by difficulty, greedily places them avoiding already-placed conflicts, then applies randomized local-search swaps/reassignments to lower the soft-score.
+
+5. Validation
+   - The `constraint_engine.check()` function inspects the generated `Timetable` and reports hard violations (infeasibilities) and soft violations with weights. It always runs all checks to provide a full diagnostic.
+
+6. Output generation
+   - `exporter` writes the canonical `timetable.json` and `violations.json`.
+   - It renders a self-contained `dashboard.html` for interactive inspection and writes Excel outputs: a detailed `timetable.xlsx`, a human-friendly `results.xlsx`, and optionally synchronises to the institutional `Output.xlsx` template using `write_template2`. It can also attempt to write assigned staff back into the source workbook.
+
+7. Run feedback
+   - `run.py` prints counts and validation summaries and returns a non-zero exit code if hard constraints are violated.
+
+Notes and operational points
+- Primary constraints and business rules are implemented in `constraint_engine.py` and encoded into the solver via `feasible_rooms` and pairwise exclusion logic.
+- Behavioural knobs: solver choice, time limit, random seed, and `Settings` in the workbook (which can tune slot length, canonical starts, and soft-constraint weights).
+- No external databases or web APIs are required: all IO is file-based (Excel, JSON, HTML). OR-Tools is the only optional external dependency that changes solver behaviour.
+
+File created: prototype/PROJECT_OVERVIEW.txt

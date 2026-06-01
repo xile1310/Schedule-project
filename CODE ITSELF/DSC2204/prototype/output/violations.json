@@ -1,0 +1,257 @@
+{
+  "summary": {
+    "feasible": true,
+    "hard_count": 0,
+    "soft_count": 27,
+    "soft_score": 78
+  },
+  "hard": [],
+  "soft": [
+    {
+      "code": "S2",
+      "severity": "soft",
+      "message": "Tutor A101085 has 5.0h idle gap on Tue",
+      "affected": [
+        "ENG1002/Quiz/ENG1002/G1@W8",
+        "ENG1002/Lecture/ENG1002/G2@W1"
+      ],
+      "weight": 18
+    },
+    {
+      "code": "S2",
+      "severity": "soft",
+      "message": "Tutor A88114 has 3.0h idle gap on Wed",
+      "affected": [
+        "SBE1109/Lectorial/SBE1109/G2@W1",
+        "SBE1109/Tutorial/SBE1109/T2@W1"
+      ],
+      "weight": 6
+    },
+    {
+      "code": "S2",
+      "severity": "soft",
+      "message": "Tutor A101501 has 3.0h idle gap on Thu",
+      "affected": [
+        "SBE2112/Quiz/SBE2112/G1@W6",
+        "SBE2112/Tutorial/SBE2112/T2@W1"
+      ],
+      "weight": 6
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1002/G1 only has 2h on campus on Tue",
+      "affected": [
+        "ENG1002/Quiz/ENG1002/G1@W8"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1002/T1 only has 2h on campus on Mon",
+      "affected": [
+        "ENG1002/Tutorial/ENG1002/T1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1002/T2 only has 2h on campus on Mon",
+      "affected": [
+        "ENG1002/Tutorial/ENG1002/T2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1002/G2 only has 2h on campus on Mon",
+      "affected": [
+        "ENG1002/Quiz/ENG1002/G2@W8"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1007/G1 only has 2h on campus on Fri",
+      "affected": [
+        "ENG1007/Lecture/ENG1007/G1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1007/G2 only has 2h on campus on Thu",
+      "affected": [
+        "ENG1007/Lecture/ENG1007/G2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1007/G1 only has 2h on campus on Mon",
+      "affected": [
+        "ENG1007/Quiz/ENG1007/G1@W5"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group ENG1007/G2 only has 2h on campus on Fri",
+      "affected": [
+        "ENG1007/Quiz/ENG1007/G2@W5"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/G1 only has 2h on campus on Wed",
+      "affected": [
+        "SBE1109/Lectorial/SBE1109/G1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/G2 only has 2h on campus on Wed",
+      "affected": [
+        "SBE1109/Lectorial/SBE1109/G2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/T1 only has 2h on campus on Thu",
+      "affected": [
+        "SBE1109/Tutorial/SBE1109/T1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/T2 only has 2h on campus on Wed",
+      "affected": [
+        "SBE1109/Tutorial/SBE1109/T2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/G1 only has 2h on campus on Mon",
+      "affected": [
+        "SBE1109/Quiz/SBE1109/G1@W4"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1109/G2 only has 2h on campus on Fri",
+      "affected": [
+        "SBE1109/Quiz/SBE1109/G2@W4"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1111/G1 only has 2h on campus on Wed",
+      "affected": [
+        "SBE1111/Lectorial/SBE1111/G1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE1111/G2 only has 2h on campus on Fri",
+      "affected": [
+        "SBE1111/Lectorial/SBE1111/G2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/G1 only has 2h on campus on Tue",
+      "affected": [
+        "SBE2112/Lectorial/SBE2112/G1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/G2 only has 2h on campus on Wed",
+      "affected": [
+        "SBE2112/Lectorial/SBE2112/G2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/T1 only has 2h on campus on Thu",
+      "affected": [
+        "SBE2112/Tutorial/SBE2112/T1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/T2 only has 2h on campus on Thu",
+      "affected": [
+        "SBE2112/Tutorial/SBE2112/T2@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/G1 only has 2h on campus on Thu",
+      "affected": [
+        "SBE2112/Quiz/SBE2112/G1@W6"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group SBE2112/G2 only has 2h on campus on Thu",
+      "affected": [
+        "SBE2112/Quiz/SBE2112/G2@W6"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group DSC1001/G1 only has 2h on campus on Thu",
+      "affected": [
+        "DSC1001/Lecture/DSC1001/G1@W1"
+      ],
+      "weight": 2
+    },
+    {
+      "code": "S4",
+      "severity": "soft",
+      "message": "Group DSC1001/G2 only has 2h on campus on Fri",
+      "affected": [
+        "DSC1001/Lecture/DSC1001/G2@W1"
+      ],
+      "weight": 2
+    }
+  ]
+}
