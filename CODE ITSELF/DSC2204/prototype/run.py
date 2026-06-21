@@ -14,7 +14,7 @@ Flag overrides:
 Outputs:
     output/timetable.json    — canonical schedule
     output/violations.json   — constraint engine report
-    output/dashboard.html    — interactive dashboard
+    output/schedule_output.html — static schedule snapshot
     output/timetable.xlsx    — detailed multi-sheet output
     output/results.xlsx      — simple one-sheet results
     ../Output.xlsx           — populated SIT template (in place)
@@ -77,6 +77,13 @@ def main():
         f"{sum(len(c.activities) for c in universe.courses)} activities, "
         f"{len(universe.rooms)} rooms, {len(universe.tutors)} tutors")
 
+    if not args.ignore_remarks:
+        from src.remarks_parser import parse_all_remarks
+        parsed, remark_warnings = parse_all_remarks(universe)
+        say(f"Remarks parsed: {parsed} constraints injected from Column K")
+        for w in remark_warnings:
+            say(f"  WARNING (room pin): {w}")
+
     solver = args.solver
     if solver == "auto":
         try:
@@ -116,7 +123,7 @@ def main():
 
     say("")
     safe(str(out / "timetable.json"), lambda: write_json(timetable, report, out))
-    safe(str(out / "dashboard.html"), lambda: write_dashboard(timetable, report, universe, out / "dashboard.html"))
+    safe(str(out / "schedule_output.html"), lambda: write_dashboard(timetable, report, universe, out / "schedule_output.html"))
     safe(str(out / "timetable.xlsx"), lambda: write_timetable_xlsx(timetable, universe, out / "timetable.xlsx"))
     safe(str(out / "results.xlsx"),   lambda: write_simple_results(timetable, universe, out / "results.xlsx"))
 

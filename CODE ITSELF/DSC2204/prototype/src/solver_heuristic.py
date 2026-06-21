@@ -55,6 +55,48 @@ def solve(universe: Universe, time_limit_s: int = 30,
     rng = random.Random(seed)
     activities = universe.all_activities()
     courses_by_code = {c.code: c for c in universe.courses}
+
+    from .data_loader import DAY_START_HOUR
+    _slot = lambda hh: (hh - DAY_START_HOUR) * 2
+    slot_09 = _slot(9)
+    slot_11 = _slot(11)
+    slot_12 = _slot(12)
+    slot_13 = _slot(13)
+    slot_14 = _slot(14)
+    slot_17 = _slot(17)
+    slot_18 = _slot(18)
+    LUNCH_PAIRS = list(range(slot_11, slot_14 - 1))
+
+    def _tutor_has_lunch_gap(tid: str, day: str, new_start: int, new_dur: int) -> bool:
+        occupied: set[int] = set()
+        for other in placed.values():
+            if other.day != day:
+                continue
+            if tid in {other.tutor_id, *getattr(other, "co_tutor_ids", [])}:
+                occupied.update(range(other.start_index,
+                                      other.start_index + other.duration_slots))
+        occupied.update(range(new_start, new_start + new_dur))
+        return any(p not in occupied and (p + 1) not in occupied for p in LUNCH_PAIRS)
+
+    def _cohort_has_lunch_gap(coh: str, si, day: str, new_start: int, new_dur: int) -> bool:
+        occupied: set[int] = set()
+        for aid, other in placed.items():
+            if other.day != day:
+                continue
+            oc = cohort_of.get(aid)
+            os = subidx_of.get(aid)
+            if oc != coh:
+                continue
+            if si is not None and os is not None and os != si:
+                continue
+            occupied.update(range(other.start_index,
+                                  other.start_index + other.duration_slots))
+        occupied.update(range(new_start, new_start + new_dur))
+        return any(p not in occupied and (p + 1) not in occupied for p in LUNCH_PAIRS)
+
+    tutor_avail: dict[str, dict[str, list[int]]] = {
+        t.id: t.availability for t in universe.tutors
+    }
     cohort_of = {a.id: _cohort(a, courses_by_code) for a in activities}
     subidx_of = {a.id: _subindex(a.group_id) for a in activities}
     days = universe.days
@@ -100,6 +142,35 @@ def solve(universe: Universe, time_limit_s: int = 30,
         if a.fixed_start_index is not None and start != a.fixed_start_index: return False
         end = start + a.duration_slots
         if end > n_slots: return False
+
+        # Time-window rules (mirror the CP-SAT solver hard constraints)
+        if start < slot_09: return False                              # A1: no classes before 09:00
+        if end > slot_18: return False                                # global end-by-18:00
+        if day == "Wed" and end > slot_13: return False              # Wed afternoon ban
+        if day == "Fri":
+            if not (end <= slot_12 or start >= slot_14): return False # Fri protected 12:00–14:00
+            if end > slot_17: return False                            # Fri end-by-17:00
+
+        # Partial tutor availability
+        for tid in {a.tutor_id, *a.co_tutor_ids}:
+            avail = tutor_avail.get(tid)
+            if not avail or day not in avail:
+                continue
+            day_slots = avail[day]
+            if not day_slots:
+                return False  # day fully blocked
+            allowed = set(day_slots)
+            if any((start + k) not in allowed for k in range(a.duration_slots)):
+                return False
+
+        # Flexible lunch gap — tutor and cohort must keep a free 1h in 11:00–14:00
+        for tid in {a.tutor_id, *a.co_tutor_ids}:
+            if not _tutor_has_lunch_gap(tid, day, start, a.duration_slots):
+                return False
+        if not _cohort_has_lunch_gap(cohort_of[a.id], subidx_of[a.id],
+                                     day, start, a.duration_slots):
+            return False
+
         # collide check vs already placed (week-aware)
         for other in placed.values():
             if other.day != day: continue

@@ -264,6 +264,117 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
                 affected=[x.activity_id],
             ))
 
+    # ------------------------------------------------------------------
+    # HARD time-window rules (A1/A2/A3, Fri windows)
+    from .data_loader import DAY_START_HOUR
+    def _slot(hh: int) -> int:
+        return (hh - DAY_START_HOUR) * 2
+    slot_09 = _slot(9)
+    slot_12 = _slot(12)
+    slot_13 = _slot(13)
+    slot_14 = _slot(14)
+    slot_17 = _slot(17)
+    slot_18 = _slot(18)
+
+    for x in a:
+        start = x.start_index
+        end = x.start_index + x.duration_slots
+        # A1: No classes before 09:00
+        if start < slot_09:
+            report.hard.append(Violation(
+                code="H_TIME_A1", severity="hard",
+                message=f"{x.activity_id} starts before 09:00 on {x.day}",
+                affected=[x.activity_id],
+            ))
+        # Global end-by 18:00
+        if end > slot_18:
+            report.hard.append(Violation(
+                code="H_TIME_END18", severity="hard",
+                message=f"{x.activity_id} ends after 18:00 on {x.day}",
+                affected=[x.activity_id],
+            ))
+        # A2: Wed afternoon ban — no class overlapping/starting from 13:00
+        if x.day == 'Wed' and end > slot_13:
+            report.hard.append(Violation(
+                code="H_TIME_WED_PM", severity="hard",
+                message=f"{x.activity_id} overlaps Wed afternoon from 13:00",
+                affected=[x.activity_id],
+            ))
+        # Fri protected window 12:00-14:00 and no Fri classes after 17:00
+        if x.day == 'Fri':
+            if start in (slot_12, slot_12 + 1) or (start < slot_14 and end > slot_12):
+                report.hard.append(Violation(
+                    code="H_TIME_FRI_WINDOW", severity="hard",
+                    message=f"{x.activity_id} violates Fri protected window 12:00-14:00",
+                    affected=[x.activity_id],
+                ))
+            if end > slot_17:
+                report.hard.append(Violation(
+                    code="H_TIME_FRI_END17", severity="hard",
+                    message=f"{x.activity_id} ends after 17:00 on Fri",
+                    affected=[x.activity_id],
+                ))
+
+    # H_LUNCH: flexible lunch gap — each tutor and each student cohort-subgroup
+    # must have at least one free consecutive 1-hour (2-slot) window within
+    # 11:00–14:00 on every day they are scheduled.
+    LUNCH_START = _slot(11)
+    LUNCH_END   = _slot(14)
+    LUNCH_PAIRS = list(range(LUNCH_START, LUNCH_END - 1))  # [slot_11 .. slot_13]
+
+    def _has_lunch_gap(occupied: set) -> bool:
+        return any(p not in occupied and (p + 1) not in occupied for p in LUNCH_PAIRS)
+
+    # ---- per tutor ----
+    by_tutor_day: dict[tuple, list] = defaultdict(list)
+    for x in a:
+        for tid in {x.tutor_id, *getattr(x, "co_tutor_ids", [])}:
+            by_tutor_day[(tid, x.day)].append(x)
+
+    for (tid, day), acts in by_tutor_day.items():
+        occupied: set[int] = set()
+        for x in acts:
+            occupied.update(range(x.start_index, x.start_index + x.duration_slots))
+        if not _has_lunch_gap(occupied):
+            report.hard.append(Violation(
+                code="H_LUNCH", severity="hard",
+                message=f"Tutor {tid} has no 1h lunch gap in 11:00–14:00 on {day}",
+                affected=[x.activity_id for x in acts],
+            ))
+
+    # ---- per cohort-subgroup ----
+    # Collect (cohort, subgroup_index, day) → list of assignments
+    csd_acts: dict[tuple, list] = defaultdict(list)
+    for x in a:
+        coh = _cohort_of(x, courses_by_code)
+        si  = _subgroup_index(x.group_id)
+        csd_acts[(coh, si, x.day)].append(x)
+
+    # For each cohort+day, check each specific subgroup (numbered) combined
+    # with the whole-cohort "All" activities that every student attends.
+    coh_day_subs: dict[tuple, set] = defaultdict(set)
+    for (coh, si, day) in csd_acts:
+        coh_day_subs[(coh, day)].add(si)
+
+    for (coh, day), subs in coh_day_subs.items():
+        numbered = {s for s in subs if s is not None}
+        all_acts = csd_acts.get((coh, None, day), [])
+        groups_to_check = [(k, all_acts + csd_acts.get((coh, k, day), []))
+                           for k in numbered] if numbered else [(None, all_acts)]
+        for k, combined in groups_to_check:
+            if not combined:
+                continue
+            occupied_c: set[int] = set()
+            for x in combined:
+                occupied_c.update(range(x.start_index, x.start_index + x.duration_slots))
+            if not _has_lunch_gap(occupied_c):
+                label = f"{coh} subgroup {k}" if k is not None else coh
+                report.hard.append(Violation(
+                    code="H_LUNCH", severity="hard",
+                    message=f"Cohort {label} has no 1h lunch gap in 11:00–14:00 on {day}",
+                    affected=[x.activity_id for x in combined],
+                ))
+
     # ------------------- SOFT --------------------------------------------
 
     # S1 — mode switches in adjacent slots for same tutor or group

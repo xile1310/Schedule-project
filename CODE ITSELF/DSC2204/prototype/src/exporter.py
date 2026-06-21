@@ -4,7 +4,7 @@ Segment 5 — Output
 Produces:
 * `timetable.json`  — machine-readable schedule (the canonical artefact)
 * `violations.json` — constraint engine report
-* `dashboard.html`  — single-file interactive dashboard with stakeholder views
+* `schedule_output.html` — single-file static schedule snapshot with stakeholder views
 
 The HTML is intentionally self-contained (no external assets) so it
 can be opened from disk, emailed, or embedded in a share drive.

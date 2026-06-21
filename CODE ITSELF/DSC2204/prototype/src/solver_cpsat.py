@@ -47,6 +47,12 @@ from .models import (
 
 def feasible_rooms(activity: Activity, universe: Universe) -> List[Room]:
     """All rooms an activity may legally occupy."""
+    # Hard venue pin from a remark takes priority over all other constraints.
+    if getattr(activity, "fixed_room_id", None):
+        pinned = [r for r in universe.rooms if r.id == activity.fixed_room_id]
+        if pinned:
+            return pinned
+
     rooms: list[Room] = []
     atype = activity.activity_type.value
     mode = activity.delivery_mode.value
@@ -178,7 +184,162 @@ def solve(universe: Universe, time_limit_s: int = 60,
         )
         if a.fixed_day:
             model.Add(day_var[a.id] == days.index(a.fixed_day))
+        # ------------------------------------------------------------------
+        # Additional hard time-window rules from policy
+        # A1: No classes before 09:00
+        # A1/A2/A3, protected windows: lunch, Wed afternoon ban from 13:00,
+        # Fri protected window 12:00-14:00, and no Friday classes after 17:00.
+        from .data_loader import DAY_START_HOUR
+        _slot = lambda hh: (hh - DAY_START_HOUR) * 2
+        slot_09 = _slot(9)
+        slot_12 = _slot(12)
+        slot_13 = _slot(13)
+        slot_14 = _slot(14)
+        slot_17 = _slot(17)
+        slot_18 = _slot(18)
+
+        # Enforce earliest start at 09:00
+        model.Add(start_var[a.id] >= slot_09)
+
+        # Enforce no activity ends after 18:00 (global)
+        model.Add(start_var[a.id] + a.duration_slots <= slot_18)
+
+        # Wednesday: no classes in the afternoon starting/overlapping from 13:00
+        if "Wed" in days:
+            is_wed = model.NewBoolVar(f"is_wed_{a.id}")
+            model.Add(day_var[a.id] == days.index("Wed")).OnlyEnforceIf(is_wed)
+            model.Add(day_var[a.id] != days.index("Wed")).OnlyEnforceIf(is_wed.Not())
+            model.Add(start_var[a.id] + a.duration_slots <= slot_13).OnlyEnforceIf(is_wed)
+
+        # Friday protected window 12:00-14:00 and stricter end-by-17:00
+        if "Fri" in days:
+            is_fri = model.NewBoolVar(f"is_fri_{a.id}")
+            model.Add(day_var[a.id] == days.index("Fri")).OnlyEnforceIf(is_fri)
+            model.Add(day_var[a.id] != days.index("Fri")).OnlyEnforceIf(is_fri.Not())
+            before = model.NewBoolVar(f"fri_before_{a.id}")
+            after = model.NewBoolVar(f"fri_after_{a.id}")
+            model.Add(start_var[a.id] + a.duration_slots <= slot_12).OnlyEnforceIf(before)
+            model.Add(start_var[a.id] >= slot_14).OnlyEnforceIf(after)
+            # If it's Friday, either before 12:00 or after 14:00 must hold
+            model.AddBoolOr([before, after, is_fri.Not()])
+            # Additionally, no Friday classes ending after 17:00
+            model.Add(start_var[a.id] + a.duration_slots <= slot_17).OnlyEnforceIf(is_fri)
         # fixed_start_index is now baked into the domain above
+
+    # Tutor availability — enforce tutor.availability windows (full-day blocks and
+    # partial-day windows parsed from Column K remarks).
+    tutor_map = {t.id: t for t in universe.tutors}
+    for a in activities:
+        for tid in {a.tutor_id, *a.co_tutor_ids}:
+            t = tutor_map.get(tid)
+            if not t or not t.availability:
+                continue
+            for day_name, allowed_slots in t.availability.items():
+                if day_name not in days:
+                    continue
+                day_idx = days.index(day_name)
+                if len(allowed_slots) == 0:
+                    # Day completely blocked for this tutor
+                    model.Add(day_var[a.id] != day_idx)
+                else:
+                    # Partial day availability — restrict to slots where the full
+                    # activity fits within the tutor's available window.
+                    allowed_set = set(allowed_slots)
+                    duration = a.duration_slots
+                    valid_starts = {
+                        s for s in range(n_slots - duration + 1)
+                        if all((s + k) in allowed_set for k in range(duration))
+                    }
+                    if not valid_starts:
+                        # Activity can't fit in the window at all — block the day.
+                        model.Add(day_var[a.id] != day_idx)
+                    elif len(valid_starts) < n_slots - duration + 1:
+                        # Some starts on this day are forbidden.
+                        forbidden = [
+                            (day_idx, s)
+                            for s in range(n_slots - duration + 1)
+                            if s not in valid_starts
+                        ]
+                        model.AddForbiddenAssignments(
+                            [day_var[a.id], start_var[a.id]], forbidden
+                        )
+
+    # Flexible lunch gap -------------------------------------------------------
+    # Each tutor and each student cohort-subgroup must have at least one free
+    # consecutive 1-hour (2-slot) window within 11:00–14:00 on every day.
+    from .data_loader import DAY_START_HOUR as _DSH
+    import re as _re2
+    _sl = lambda hh: (hh - _DSH) * 2
+    LUNCH_START = _sl(11)
+    LUNCH_END   = _sl(14)
+    LUNCH_PAIRS = list(range(LUNCH_START, LUNCH_END - 1))
+
+    def _add_lunch_gap(label: str, act_ids: list) -> None:
+        safe = _re2.sub(r"[^a-zA-Z0-9]", "_", label)
+        for di in range(n_days):
+            on_day = {}
+            for aid in act_ids:
+                b = model.NewBoolVar(f"od_{safe}_{aid}_{di}")
+                model.Add(day_var[aid] == di).OnlyEnforceIf(b)
+                model.Add(day_var[aid] != di).OnlyEnforceIf(b.Not())
+                on_day[aid] = b
+            pair_free_vars = []
+            for p in LUNCH_PAIRS:
+                pf = model.NewBoolVar(f"lpf_{safe}_{di}_{p}")
+                for aid in act_ids:
+                    dur = by_id[aid].duration_slots
+                    bs = max(0, p + 1 - dur + 1)   # earliest start that covers p or p+1
+                    be = p + 1                       # latest start that covers p or p+1
+                    if bs > be:
+                        continue
+                    # Build domain: valid starts OUTSIDE the blocking range [bs, be]
+                    intervals = []
+                    if bs > 0:
+                        intervals.append([0, bs - 1])
+                    if be < n_slots - 1:
+                        intervals.append([be + 1, n_slots - 1])
+                    start_ok = model.NewBoolVar(f"sok_{safe}_{aid}_{di}_{p}")
+                    if intervals:
+                        dom_ok = cp_model.Domain.FromIntervals(intervals)
+                        model.AddLinearExpressionInDomain(
+                            start_var[aid], dom_ok).OnlyEnforceIf(start_ok)
+                    else:
+                        model.Add(start_ok == 0)  # activity always blocks this pair
+                    # pf = 1 and activity is on this day → start must be outside blocking range
+                    model.AddBoolOr([pf.Not(), on_day[aid].Not(), start_ok])
+                pair_free_vars.append(pf)
+            if pair_free_vars:
+                model.AddBoolOr(pair_free_vars)
+
+    # Apply per tutor
+    for tid, t_aids in by_tutor.items():
+        if t_aids:
+            _add_lunch_gap(f"t_{tid}", t_aids)
+
+    # Apply per cohort-subgroup
+    coh_sub_acts: dict[tuple, list] = defaultdict(list)
+    for a in activities:
+        coh = cohort_of[a.id]
+        si  = subidx_of[a.id]
+        coh_sub_acts[(coh, si)].append(a.id)
+
+    coh_numbered: dict[str, set] = defaultdict(set)
+    for a in activities:
+        si = subidx_of[a.id]
+        if si is not None:
+            coh_numbered[cohort_of[a.id]].add(si)
+
+    for coh, numbered in coh_numbered.items():
+        all_ids = coh_sub_acts.get((coh, None), [])
+        for k in numbered:
+            combined = list(set(all_ids) | set(coh_sub_acts.get((coh, k), [])))
+            if combined:
+                _add_lunch_gap(f"coh_{coh}_{k}", combined)
+
+    for coh, sub_acts_list in coh_sub_acts.items():
+        c_label, si = coh
+        if si is None and c_label not in coh_numbered:
+            _add_lunch_gap(f"coh_{c_label}", sub_acts_list)
 
     # Resource exclusion helper
     virtual_idxs = {room_index[r.id] for r in universe.rooms if r.is_virtual}

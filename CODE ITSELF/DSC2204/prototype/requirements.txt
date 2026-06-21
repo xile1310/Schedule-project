@@ -1,3 +1,5 @@
 # Production dependencies — install with:  pip install -r requirements.txt
 openpyxl>=3.1
 ortools>=9.7      # Google's CP-SAT solver (used by the production schedule generator)
+streamlit>=1.35   # Web frontend (run with: streamlit run app.py)
+anthropic>=0.40   # Claude API for LLM-assisted remarks parsing

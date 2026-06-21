@@ -19,7 +19,7 @@ spreadsheet layout is guarded so an unfamiliar reader can debug.
 from __future__ import annotations
 import re
 import warnings
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple
 
@@ -119,53 +119,6 @@ def _classify_room(name: str, suitabilities: str) -> RoomType:
 # Parse free-text Remarks into scheduling pins
 # ---------------------------------------------------------------------------
 
-_DAY_NAMES = {
-    "mon": "Mon", "monday": "Mon",
-    "tue": "Tue", "tues": "Tue", "tuesday": "Tue", "tuesdays": "Tue",
-    "wed": "Wed", "wednesday": "Wed",
-    "thu": "Thu", "thur": "Thu", "thurs": "Thu", "thursday": "Thu",
-    "fri": "Fri", "friday": "Fri", "fridays": "Fri",
-}
-
-
-def parse_remarks(remarks: str):
-    """Best-effort: pull (fixed_day, fixed_start_index) out of free text.
-
-    Recognised forms:
-        "Monday, 10am-12pm"
-        "Tuesdays, 9am-11am"
-        "Fridays, 2-4pm"
-    Returns (None, None) if no pattern matches.
-    """
-    if not remarks:
-        return None, None
-    text = str(remarks).lower()
-
-    # Day
-    fixed_day = None
-    for token, canonical in _DAY_NAMES.items():
-        if re.search(r"\b" + token + r"\b", text):
-            fixed_day = canonical
-            break
-    if fixed_day is None:
-        return None, None
-
-    # Start time — look for first "Nam" / "Npm" / "N:30am" etc.
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text)
-    if not m:
-        return fixed_day, None
-    hour = int(m.group(1))
-    minute = int(m.group(2) or 0)
-    suf = m.group(3)
-    if suf == "pm" and hour < 12:
-        hour += 12
-    if suf == "am" and hour == 12:
-        hour = 0
-    if hour < DAY_START_HOUR:
-        return fixed_day, None
-    fixed_index = (hour - DAY_START_HOUR) * 2 + (1 if minute >= 30 else 0)
-    return fixed_day, fixed_index
-
 
 
 def _default_duration(a: ActivityType) -> int:
@@ -204,11 +157,9 @@ def _group_prefix(a: ActivityType) -> str:
 # ---------------------------------------------------------------------------
 
 # 2-hour blocks (Lectures, Tutorials, "Others") — ENG cluster row of the
-# Standard Period Block sheet. Lunch sits at 11:00–12:00 between Period 1
-# and Period 2, so Period 2 starts at 12:00 (not 11:00).
+# Standard Period Block sheet.
 #   Period 1  09:00 – 11:00   (slot 2)
-#   Lunch     11:00 – 12:00   (skipped)
-#   Period 2  12:00 – 14:00   (slot 8)
+#   Period 2  12:00 – 14:00   (slot 8)  ← lunch window; allowed if a 1h gap exists elsewhere in 11:00–14:00
 #   Period 3  14:00 – 16:00   (slot 12)
 #   Period 4  16:00 – 18:00   (slot 16)
 PERIOD_STARTS_2H = [2, 8, 12, 16]
@@ -361,7 +312,7 @@ def _read_modules(path: str):
             if gid not in seen_groups:
                 groups.append(Group(id=gid, course_code=code, label="All", size=size))
                 seen_groups.add(gid)
-            fday, fstart = parse_remarks(slot["remarks"])
+            fday, fstart = None, None
             course.activities.append(Activity(
                 course_code=code, activity_type=atype, delivery_mode=mode,
                 duration_slots=duration, weeks=weeks,
@@ -372,7 +323,7 @@ def _read_modules(path: str):
         else:
             cap = _group_cap(atype)
             prefix = _group_prefix(atype)
-            fday, fstart = parse_remarks(slot["remarks"])
+            fday, fstart = None, None
             for label, gsize in _split_into_groups(size, cap, prefix):
                 gid = f"{code}/{label}"
                 if gid not in seen_groups:
@@ -528,6 +479,134 @@ def _hhmm_to_slot(hhmm: str) -> int | None:
     h, mi = int(m.group(1)), int(m.group(2))
     if h < DAY_START_HOUR: return None
     return (h - DAY_START_HOUR) * 2 + (1 if mi >= 30 else 0)
+
+
+_DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+
+_MONTH_RE = re.compile(
+    r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', re.IGNORECASE)
+
+
+def _extract_pin_from_weeks_cell(raw, semester_start=None) -> tuple:
+    """Extract (day, start_slot, duration_slots) from a Teaching Weeks cell
+    that contains a specific calendar date and time range, e.g.:
+        '22 Oct (Wed), 1.30pm-5pm'  ->  ('Wed', 9, 7)   [13:30 with DAY_START=9, 3h30m]
+        '10 Nov (Mon), 9am-1pm'     ->  ('Mon', 0, 8)
+    Returns (None, None, None) when no calendar date is present.
+
+    Strategy: LLM is tried first (handles any free-text format); regex is
+    the fallback so the function still works without an API key.
+    The day-of-week is always derived from the actual calendar date via
+    date.weekday() to avoid annotation errors; the LLM day annotation is
+    used only when date parsing fails.
+    """
+    if not raw:
+        return None, None, None
+    text = str(raw)
+
+    # Skip plain week-number cells ("1-13", "1,3,5") — no calendar date present.
+    has_text_date = bool(_MONTH_RE.search(text))
+    has_iso_date = bool(re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", text))
+    if not has_text_date and not has_iso_date and not isinstance(raw, (date, datetime)):
+        return None, None, None
+
+    # ── Step 1: derive day from the calendar date (authoritative) ───────────
+    day = None
+    if isinstance(raw, datetime):
+        d = raw.date()
+        weekday = d.weekday()
+        if weekday < 5:
+            day = _DOW_NAMES[weekday]
+    elif isinstance(raw, date):
+        weekday = raw.weekday()
+        if weekday < 5:
+            day = _DOW_NAMES[weekday]
+    else:
+        m_iso = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+        if m_iso:
+            try:
+                d = date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+                weekday = d.weekday()
+                if weekday < 5:
+                    day = _DOW_NAMES[weekday]
+            except ValueError:
+                pass
+        else:
+            m_date = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?(?:\s+(\d{4}))?", text)
+            if m_date:
+                day_num = int(m_date.group(1))
+                mon_str = m_date.group(2)[:3].lower()
+                if mon_str in _MONTHS:
+                    ref_year = (int(m_date.group(3)) if m_date.group(3)
+                                else (semester_start.year if semester_start
+                                      else date.today().year))
+                    try:
+                        d = date(ref_year, _MONTHS[mon_str], day_num)
+                        weekday = d.weekday()
+                        if weekday < 5:
+                            day = _DOW_NAMES[weekday]
+                    except ValueError:
+                        pass
+
+    # ── Step 2: extract time range ──────────────────────────────────────────
+    start_slot = None
+    dur_slots  = None
+
+    # Primary: LLM (handles any free-text time format)
+    try:
+        from .remarks_parser import parse_weeks_cell_llm
+        llm = parse_weeks_cell_llm(text)
+        if llm:
+            sh = llm.get("start_hour")
+            sm = int(llm.get("start_min") or 0)
+            eh = llm.get("end_hour")
+            em = int(llm.get("end_min") or 0)
+            # Use LLM day only when calendar-date derivation failed
+            if day is None and llm.get("pin_day") in ("Mon","Tue","Wed","Thu","Fri"):
+                day = llm["pin_day"]
+            if sh is not None and sh >= DAY_START_HOUR:
+                start_slot = (sh - DAY_START_HOUR) * 2 + (1 if sm >= 30 else 0)
+                if eh is not None and (eh * 60 + em) > (sh * 60 + sm):
+                    dur_slots = ((eh * 60 + em) - (sh * 60 + sm)) // 30
+    except Exception:
+        pass
+
+    # Fallback: regex time range (works without API key)
+    if start_slot is None:
+        m_range = re.search(
+            r"(\d{1,2})(?:[.:](\d{2}))?\s*(am|pm)\s*-\s*(\d{1,2})(?:[.:](\d{2}))?\s*(am|pm)",
+            text, re.IGNORECASE)
+        if m_range:
+            sh = int(m_range.group(1)); sm = int(m_range.group(2) or 0)
+            ssuf = m_range.group(3).lower()
+            eh = int(m_range.group(4)); em = int(m_range.group(5) or 0)
+            esuf = m_range.group(6).lower()
+            if ssuf == "pm" and sh < 12: sh += 12
+            if ssuf == "am" and sh == 12: sh = 0
+            if esuf == "pm" and eh < 12: eh += 12
+            if esuf == "am" and eh == 12: eh = 0
+            start_total = sh * 60 + sm
+            end_total   = eh * 60 + em
+            if sh >= DAY_START_HOUR and end_total > start_total:
+                start_slot = (sh - DAY_START_HOUR) * 2 + (1 if sm >= 30 else 0)
+                dur_slots  = (end_total - start_total) // 30
+        else:
+            # Start time only (no end time → no duration)
+            m_time = re.search(r"(\d{1,2})[.:](\d{2})\s*(am|pm)", text, re.IGNORECASE)
+            if not m_time:
+                m_time = re.search(r"\b(\d{1,2})\s*(am|pm)\b", text, re.IGNORECASE)
+            if m_time:
+                groups = m_time.groups()
+                hour   = int(groups[0])
+                minute = int(groups[1]) if len(groups) > 2 else 0
+                suffix = groups[-1].lower()
+                if suffix == "pm" and hour < 12: hour += 12
+                if suffix == "am" and hour == 12: hour = 0
+                if hour >= DAY_START_HOUR:
+                    start_slot = (hour - DAY_START_HOUR) * 2 + (1 if minute >= 30 else 0)
+
+    return day, start_slot, dur_slots
 
 
 
@@ -1042,6 +1121,7 @@ def load_from_worksheet(worksheet_path: str,
             atype=atype, mode=mode, weeks=set(),
             remarks=r["remarks"], subgroups=r.get("subgroups"),
             rows=[],
+            raw_weeks_cell=r["weeks"],   # preserved for day+time pin extraction
         ))
         row_weeks = set(_parse_weeks_range(r["weeks"], _sem_start))
         slot["weeks"].update(row_weeks)
@@ -1090,7 +1170,24 @@ def load_from_worksheet(worksheet_path: str,
 
         all_weeks = sorted(slot["weeks"])
         duration = _default_duration(atype)
-        fday, fstart = (None, None) if ignore_remarks else parse_remarks(slot["remarks"])
+        if ignore_remarks:
+            fday, fstart = None, None
+        else:
+            fday, fstart = None, None
+            if slot["remarks"]:
+                from .remarks_parser import parse_remarks_llm
+                fday, fstart = parse_remarks_llm(slot["remarks"])
+            # Last resort: extract day+time embedded in the Teaching Weeks cell.
+            # "22 Oct (Wed), 1.30pm-5pm" pins to Wed 13:30 with duration 3.5h;
+            # the day is computed from the date, not the annotation.
+            pin_day, pin_start, fdur = _extract_pin_from_weeks_cell(
+                slot.get("raw_weeks_cell"), _sem_start)
+            if fday is None and pin_day is not None:
+                fday = pin_day
+            if fstart is None and pin_start is not None:
+                fstart = pin_start
+            if fdur is not None:
+                duration = fdur   # override default with cell-derived duration
 
         # ---- distinct staff across every row of this (code, atype, mode) ----
         distinct_staff: list = []

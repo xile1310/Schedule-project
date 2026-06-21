@@ -147,6 +147,7 @@ class Activity:
     size: int                # number of attendees (for room capacity check)
     fixed_day: Optional[str] = None       # if scheduling is hard-pinned
     fixed_start_index: Optional[int] = None
+    fixed_room_id: Optional[str] = None   # if a specific venue is required
     notes: str = ""
     co_tutor_ids: List[str] = field(default_factory=list)  # co-teachers (Staff 2, ...)
 
