@@ -433,6 +433,38 @@ def _date_to_week(token: str, semester_start) -> "int | None":
     return wk if wk >= 1 else None
 
 
+def _read_calendar_holidays(cal_ws) -> list:
+    """Read public holiday ISO date strings from a Calendar worksheet.
+
+    Recognises any row where column A contains 'holiday' (case-insensitive).
+    The value (column B) may be a date object or a string (ISO or DD-MM-YYYY).
+    Multiple rows with the same key are all collected.
+    """
+    holidays: list[str] = []
+    for row in cal_ws.iter_rows(values_only=True):
+        if not row or not row[0]:
+            continue
+        key = str(row[0]).strip().lower()
+        if "holiday" not in key:
+            continue
+        val = row[1] if len(row) > 1 else None
+        if val is None:
+            continue
+        if hasattr(val, "year"):
+            d = val if isinstance(val, date) else val.date()
+            holidays.append(d.isoformat())
+        else:
+            for part in str(val).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    holidays.append(date.fromisoformat(part[:10]).isoformat())
+                except (ValueError, TypeError):
+                    pass
+    return holidays
+
+
 def _parse_weeks_range(raw, semester_start=None) -> List[int]:
     """Parse a Teaching Weeks cell into a list of week numbers, tolerating the
     real-world SIT formats:
@@ -609,6 +641,43 @@ def _extract_pin_from_weeks_cell(raw, semester_start=None) -> tuple:
     return day, start_slot, dur_slots
 
 
+# Matches cells that are unambiguously pure week-number notation:
+# "1-13", "1,3,5,7", "2", "  6  " — only 1-2-digit numbers, commas, dashes, spaces.
+# Excludes ISO dates (2025-10-22) and years (4-digit sequences).
+_PURE_WEEK_RE = re.compile(r'^(?!.*\d{3})[\d\s,\-]+$')
+
+
+def _parse_weeks_and_pins(raw, semester_start=None):
+    """Parse a Teaching Weeks cell into (weeks_set, pins_list).
+
+    Pure numeric cells (e.g. "1-13", "1,3,5") are parsed directly without
+    calling the LLM — the meaning is unambiguous.  Every other cell (dates,
+    free text, mixed) is sent to Claude which is the primary parser.
+
+    Returns:
+        (set[int], list[dict])  — weeks and any date/time pins.
+        Each pin dict: {"week": int, "day": str, "start_time": str|None, "end_time": str|None}
+
+    Raises:
+        RuntimeError if the LLM is required but the API key is missing or the
+        call fails — callers should surface this as a hard upload error.
+    """
+    if raw is None or str(raw).strip() == "":
+        return set(range(1, 14)), []
+
+    text = str(raw).strip()
+
+    # Unambiguous numeric notation — skip LLM entirely.
+    if _PURE_WEEK_RE.match(text):
+        return set(_parse_weeks_range(raw, semester_start)), []
+
+    # Everything else: LLM is the primary (and only) parser.
+    sem_iso = semester_start.isoformat() if semester_start else "2025-09-08"
+    from .remarks_parser import parse_teaching_weeks_llm
+    result = parse_teaching_weeks_llm(text, sem_iso)
+    weeks = set(result["weeks"]) or set(range(1, 14))
+    pins = result.get("pins", [])
+    return weeks, pins
 
 
 def _apply_settings(wb) -> None:
@@ -812,7 +881,8 @@ def load_from_inputs(path: str) -> Universe:
         sem_start = SEMESTER_START_DATE
     weeks_list = _parse_weeks_range(cal_kv.get("Teaching weeks") or "1-13")
     week_dates = {w: (sem_start + timedelta(days=(w - 1) * 7)).isoformat() for w in weeks_list}
-    calendar = Calendar(teaching_weeks=weeks_list, week_dates=week_dates)
+    _holidays = _read_calendar_holidays(cal_ws)
+    calendar = Calendar(teaching_weeks=weeks_list, week_dates=week_dates, public_holidays=_holidays)
 
     courses = sorted(by_code.values(), key=lambda c: (c.year, c.code))
     return Universe(
@@ -1127,11 +1197,13 @@ def load_from_worksheet(worksheet_path: str,
             atype=atype, mode=mode, weeks=set(),
             remarks=r["remarks"], subgroups=r.get("subgroups"),
             rows=[], is_evening=False,
-            raw_weeks_cell=r["weeks"],   # preserved for day+time pin extraction
+            raw_weeks_cell=r["weeks"],   # preserved for reference
+            weeks_pins=[],               # LLM-extracted date/time pins
             _has_empty_weeks=False,      # set True when any row's Teaching Weeks cell is blank
             _has_explicit_weeks=False,   # set True when any row has explicit week values
         ))
-        row_weeks = set(_parse_weeks_range(r["weeks"], _sem_start))
+        row_weeks, row_pins = _parse_weeks_and_pins(r["weeks"], _sem_start)
+        slot["weeks_pins"].extend(row_pins)
         if r["weeks"] is None or str(r["weeks"]).strip() == "":
             slot["_has_empty_weeks"] = True
         else:
@@ -1150,6 +1222,40 @@ def load_from_worksheet(worksheet_path: str,
         if r["remarks"] and not slot["remarks"]:
             slot["remarks"] = r["remarks"]
 
+    # ---- pre-expand slots with multi-day date pins -------------------------
+    # When Teaching Weeks specifies dates on different days of the week
+    # (e.g. "15 Sep 2025 and 19 Nov 2025" = Mon wk2 + Wed wk11), a single
+    # Activity can only hold one fixed_day, so we split into one mini-slot
+    # per pin so each gets the right day constraint.
+    expanded_agg: list[dict] = []
+    for _slot in aggregated.values():
+        _pins = _slot.get("weeks_pins", [])
+        _pinned = {p["week"]: p for p in _pins if p.get("week")}
+        _pin_days = {p.get("day") for p in _pinned.values() if p.get("day")}
+        if len(_pinned) >= 2 and len(_pin_days) >= 2:
+            _covered = set(_pinned.keys())
+            _uncovered = sorted(w for w in _slot["weeks"] if w not in _covered)
+            for _wk, _pin in sorted(_pinned.items()):
+                _ms = dict(_slot)
+                _ms["weeks"] = {_wk}
+                _ms["weeks_pins"] = [_pin]
+                _ms["rows"] = [
+                    {"staff": _r["staff"], "weeks": _r["weeks"] & {_wk} or {_wk}}
+                    for _r in _slot["rows"]
+                ]
+                expanded_agg.append(_ms)
+            if _uncovered:
+                _ms = dict(_slot)
+                _ms["weeks"] = set(_uncovered)
+                _ms["weeks_pins"] = []
+                _ms["rows"] = [
+                    {"staff": _r["staff"], "weeks": _r["weeks"] & set(_uncovered)}
+                    for _r in _slot["rows"]
+                ]
+                expanded_agg.append(_ms)
+        else:
+            expanded_agg.append(_slot)
+
     by_code: dict[str, Course] = {}
     tutors_by_id: dict[str, Tutor] = {}
     groups: list[Group] = []
@@ -1164,7 +1270,7 @@ def load_from_worksheet(worksheet_path: str,
         _tname = tutor_names_override.get(_tid, _ns or _is or _tid)
         return _tid, _tname
 
-    for slot in aggregated.values():
+    for slot in expanded_agg:
         code = slot["code"]
         if slot["prog"]:
             prog_prefix, year = _prog_and_year(slot["prog"])
@@ -1192,17 +1298,31 @@ def load_from_worksheet(worksheet_path: str,
             if slot["remarks"]:
                 from .remarks_parser import parse_remarks_llm
                 fday, fstart = parse_remarks_llm(slot["remarks"])
-            # Last resort: extract day+time embedded in the Teaching Weeks cell.
-            # "22 Oct (Wed), 1.30pm-5pm" pins to Wed 13:30 with duration 3.5h;
-            # the day is computed from the date, not the annotation.
-            pin_day, pin_start, fdur = _extract_pin_from_weeks_cell(
-                slot.get("raw_weeks_cell"), _sem_start)
-            if fday is None and pin_day is not None:
-                fday = pin_day
-            if fstart is None and pin_start is not None:
-                fstart = pin_start
-            if fdur is not None:
-                duration = fdur   # override default with cell-derived duration
+            # Use LLM-parsed date/time pins from the Teaching Weeks cell.
+            # pins are already extracted during loading via _parse_weeks_and_pins().
+            pins = slot.get("weeks_pins", [])
+            if pins:
+                p = pins[0]  # use first pin for the activity's global day/time pin
+                p_day = p.get("day")
+                p_start = p.get("start_time")
+                p_end = p.get("end_time")
+                # A specific calendar date in Teaching Weeks is authoritative —
+                # it overrides any soft day preference from Remarks.
+                if p_day in ("Mon", "Tue", "Wed", "Thu", "Fri"):
+                    fday = p_day
+                if p_start:
+                    try:
+                        ph, pm = map(int, p_start.split(":"))
+                        if ph >= DAY_START_HOUR:
+                            fstart = (ph - DAY_START_HOUR) * 2 + (1 if pm >= 30 else 0)
+                            if p_end:
+                                eh, em = map(int, p_end.split(":"))
+                                end_total = eh * 60 + em
+                                start_total = ph * 60 + pm
+                                if end_total > start_total:
+                                    duration = (end_total - start_total) // 30
+                    except (ValueError, AttributeError):
+                        pass
 
         # ---- distinct staff across every row of this (code, atype, mode) ----
         distinct_staff: list = []
@@ -1392,9 +1512,9 @@ def load_from_worksheet(worksheet_path: str,
     # Rooms MUST live in the worksheet's own 'Rooms' tab.  We refuse to
     # silently fall back to inputs.xlsx or template 2.xlsx — every run prints
     # exactly which file the rooms came from so the planner can verify.
-    import sys as _sys
     if "Rooms" in wb.sheetnames:
         rooms = _read_inputs_rooms(worksheet_path)
+        import sys as _sys
         print(f"[loader] rooms loaded from worksheet: {worksheet_path} "
               f"(Rooms tab, {len(rooms)} rooms)", file=_sys.stderr)
     else:
@@ -1406,7 +1526,8 @@ def load_from_worksheet(worksheet_path: str,
 
     # Calendar: prefer a Calendar tab in THIS workbook.
     if "Calendar" in wb.sheetnames:
-        cal_kv = {row[0]: row[1] for row in wb["Calendar"].iter_rows(values_only=True) if row and row[0]}
+        _cal_ws = wb["Calendar"]
+        cal_kv = {row[0]: row[1] for row in _cal_ws.iter_rows(values_only=True) if row and row[0]}
         raw_start = cal_kv.get("Semester start date")
         if raw_start is not None and hasattr(raw_start, "year"):
             sem_start = raw_start if isinstance(raw_start, date) else date.fromisoformat(str(raw_start)[:10])
@@ -1415,11 +1536,13 @@ def load_from_worksheet(worksheet_path: str,
         else:
             sem_start = date.fromisoformat(str(semester_start)[:10])
         weeks_list = _parse_weeks_range(cal_kv.get("Teaching weeks") or teaching_weeks)
+        _holidays = _read_calendar_holidays(_cal_ws)
     else:
         sem_start = date.fromisoformat(str(semester_start)[:10])
         weeks_list = _parse_weeks_range(teaching_weeks)
+        _holidays = []
     week_dates = {w: (sem_start + timedelta(days=(w - 1) * 7)).isoformat() for w in weeks_list}
-    calendar = Calendar(teaching_weeks=weeks_list, week_dates=week_dates)
+    calendar = Calendar(teaching_weeks=weeks_list, week_dates=week_dates, public_holidays=_holidays)
 
     if mode_warnings:
         import sys as _sys

@@ -193,6 +193,7 @@ class Course:
 class Calendar:
     teaching_weeks: List[int]                 # e.g. [1..6, 8..13]
     week_dates: Dict[int, str] = field(default_factory=dict)  # optional
+    public_holidays: List[str] = field(default_factory=list)  # ISO date strings e.g. ["2025-10-20"]
 
 
 # ---------------------------------------------------------------------------

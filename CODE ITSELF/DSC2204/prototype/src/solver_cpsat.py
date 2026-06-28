@@ -361,6 +361,45 @@ def solve(universe: Universe, time_limit_s: int = 60,
     # a Quiz in week 6 and a Lecture running weeks 1-13 both appear "on Tuesday"
     # simultaneously, making the constraint spuriously infeasible.
 
+    # Public holiday constraints: if (week W, day D) is a public holiday,
+    # any activity that runs during week W cannot be placed on day D.
+    # day_var is week-agnostic, so this conservatively forbids the day across
+    # all weeks — correct because the same slot repeats every week.
+    _ph_week_day: list[tuple[int, int]] = []  # (teaching_week, day_index)
+    if universe.calendar.public_holidays and universe.calendar.week_dates:
+        from datetime import date as _phdate, timedelta as _phtd
+        _DOW = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        _wk1_iso = universe.calendar.week_dates.get(min(universe.calendar.teaching_weeks))
+        if _wk1_iso:
+            _sem_start = _phdate.fromisoformat(_wk1_iso)
+            for _iso in universe.calendar.public_holidays:
+                try:
+                    _hd = _phdate.fromisoformat(_iso)
+                    _delta = (_hd - _sem_start).days
+                    if _delta < 0:
+                        continue
+                    _hwk = _delta // 7 + 1
+                    _hwdi = _hd.weekday()   # 0=Mon ... 4=Fri
+                    if _hwdi >= 5:
+                        continue
+                    _hday = _DOW[_hwdi]
+                    if _hday in days:
+                        _ph_week_day.append((_hwk, days.index(_hday)))
+                except (ValueError, TypeError):
+                    pass
+    if _ph_week_day:
+        for a in activities:
+            # Only constrain single-week activities. Multi-week activities
+            # (e.g. a lecture running weeks 1-13) keep their day assignment and
+            # simply don't meet on the holiday date — that occurrence is cancelled
+            # by the calendar, not by changing the scheduled day for all weeks.
+            if len(a.weeks) != 1:
+                continue
+            _a_weeks = set(a.weeks)
+            for (_h_wk, _h_dix) in _ph_week_day:
+                if _h_wk in _a_weeks:
+                    model.Add(day_var[a.id] != _h_dix)
+
     # Resource exclusion helper
     virtual_idxs = {room_index[r.id] for r in universe.rooms if r.is_virtual}
     v_idx = next(iter(virtual_idxs)) if virtual_idxs else -1

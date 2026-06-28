@@ -341,6 +341,133 @@ def parse_weeks_cell_llm(cell_text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Primary teaching-weeks parser — LLM-first, raises on failure
+# ---------------------------------------------------------------------------
+
+_SYSTEM_TEACHING_WEEKS = """\
+You are a university timetable assistant. Parse a "Teaching Weeks" cell from a module planning spreadsheet.
+
+Your job is ONLY to extract dates and times — do NOT calculate week numbers yourself.
+
+Return ONLY a JSON object — no markdown, no explanation:
+
+{
+  "date_pins": [
+    {
+      "iso_date": "YYYY-MM-DD",
+      "start_time": "HH:MM" or null,
+      "end_time": "HH:MM" or null
+    }
+  ],
+  "explicit_weeks": []
+}
+
+Rules:
+1. If the cell contains specific calendar dates (e.g. "15 September 2025", "2025-10-22", "22 Oct"):
+   - Extract each date as "YYYY-MM-DD". If no year given, use the semester year from context.
+   - Extract any time range present (e.g. "9am-11am" → start "09:00", end "11:00")
+   - Convert times to 24-hour "HH:MM": "1.30pm" → "13:30", "5pm" → "17:00", "9am" → "09:00"
+   - Put results in "date_pins", leave "explicit_weeks" empty
+2. If the cell contains only plain week expressions (e.g. "weeks 1 to 6", "odd weeks", "every other week from week 2"):
+   - Put the week numbers in "explicit_weeks", leave "date_pins" empty
+   - "odd weeks" = [1,3,5,7,9,11,13], "even weeks" = [2,4,6,8,10,12]
+   - "weeks 1 to 6" = [1,2,3,4,5,6]
+3. For multiple dates, include all of them in "date_pins".
+4. Never mix date_pins and explicit_weeks — use whichever applies.
+
+Examples:
+"2025-10-22" → {"date_pins": [{"iso_date": "2025-10-22", "start_time": null, "end_time": null}], "explicit_weeks": []}
+"15 September 2025 and 19 November 2025" → {"date_pins": [{"iso_date": "2025-09-15", "start_time": null, "end_time": null}, {"iso_date": "2025-11-19", "start_time": null, "end_time": null}], "explicit_weeks": []}
+"22 Oct (Wed), 1.30pm-5pm" → {"date_pins": [{"iso_date": "2025-10-22", "start_time": "13:30", "end_time": "17:00"}], "explicit_weeks": []}
+"odd weeks" → {"date_pins": [], "explicit_weeks": [1,3,5,7,9,11,13]}
+"""
+
+
+def parse_teaching_weeks_llm(cell_text: str, semester_start_iso: str) -> dict:
+    """Parse a Teaching Weeks cell with Claude as the primary parser.
+
+    The LLM extracts ISO dates and times; Python converts dates to week numbers
+    and day-of-week (avoids LLM arithmetic errors).
+
+    Args:
+        cell_text: raw cell value (e.g. "15 September 2025 and 19 November 2025")
+        semester_start_iso: semester start in ISO format (e.g. "2025-09-08")
+
+    Returns:
+        {"weeks": [int, ...], "pins": [{"week", "day", "start_time", "end_time"}, ...]}
+
+    Raises:
+        RuntimeError if the API key is missing or the LLM call fails.
+    """
+    from datetime import date as _date
+
+    client = _get_client()
+    if client is None:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set or the 'anthropic' package is not installed. "
+            "It is required to parse free-text Teaching Weeks cells. "
+            "Set ANTHROPIC_API_KEY in your environment and restart the dashboard."
+        )
+
+    try:
+        sem_year = int(semester_start_iso[:4])
+    except (ValueError, TypeError):
+        sem_year = 2025
+
+    user_msg = f"Semester year: {sem_year}\nTeaching Weeks cell: {cell_text}"
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            temperature=0,
+            system=[{"type": "text", "text": _SYSTEM_TEACHING_WEEKS,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = _parse_json_response(response.content[0].text)
+        if not isinstance(raw, dict):
+            raise ValueError(f"unexpected response shape: {response.content[0].text!r}")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM failed to parse Teaching Weeks cell {cell_text!r}: {exc}"
+        ) from exc
+
+    # Convert date_pins → week numbers + day pins using Python arithmetic.
+    _DOW = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+    try:
+        sem_start = _date.fromisoformat(semester_start_iso)
+    except ValueError:
+        sem_start = None
+
+    weeks: list[int] = list(raw.get("explicit_weeks") or [])
+    pins: list[dict] = []
+
+    for dp in raw.get("date_pins") or []:
+        iso = dp.get("iso_date", "")
+        try:
+            d = _date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if sem_start:
+            wk = (d - sem_start).days // 7 + 1
+        else:
+            wk = None
+        dow = _DOW[d.weekday()] if d.weekday() < 5 else None
+        if wk and wk >= 1:
+            weeks.append(wk)
+            pins.append({
+                "week": wk,
+                "day": dow,
+                "start_time": dp.get("start_time"),
+                "end_time": dp.get("end_time"),
+            })
+
+    return {"weeks": sorted(set(weeks)), "pins": pins}
+
+
+# ---------------------------------------------------------------------------
 # Slot helpers  (mirror data_loader constants; import live value to stay in sync)
 # ---------------------------------------------------------------------------
 
@@ -597,7 +724,7 @@ def parse_remarks(
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=512,
             temperature=0,
             system=[

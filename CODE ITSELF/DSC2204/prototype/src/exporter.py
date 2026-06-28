@@ -50,7 +50,7 @@ def write_dashboard(timetable: Timetable, report: ViolationReport,
         "tutors": [{"id": t.id, "name": t.name} for t in universe.tutors],
         "groups": [{"id": g.id, "label": g.label, "size": g.size,
                     "course": g.course_code} for g in universe.groups],
-        "courses": [{"code": c.code, "year": c.year, "programme": c.programme}
+        "courses": [{"code": c.code, "year": c.year, "programme": (c.programme or "").upper() or c.code[:3]}
                     for c in universe.courses],
         "days": DAYS,
         "slot_min": SLOT_MIN,
