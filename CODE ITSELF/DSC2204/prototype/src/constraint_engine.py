@@ -121,12 +121,16 @@ def _slots_overlap(a: Assignment, b: Assignment) -> bool:
 import re as _re
 
 def _cohort_of(a, courses_by_code):
-    """Cohort label for an activity, e.g. 'DSC/Y1' or 'INF/Y2'."""
+    """Primary cohort label for an activity, e.g. 'DSC/Y1'."""
     code = a.course_code
     course = courses_by_code.get(code)
     year = course.year if course else 0
     prog = (course.programme if course else code[:3]).upper()
     return f"{prog}/Y{year}"
+
+def _all_cohorts_of(a, courses_by_code) -> set:
+    """All cohort labels this activity involves (primary + shared for common modules)."""
+    return {_cohort_of(a, courses_by_code)} | set(getattr(a, 'shared_cohorts', []))
 
 def _subgroup_index(group_id: str):
     """Extract the trailing subgroup number, e.g. 'DSC1001/T3' -> 3.
@@ -141,9 +145,12 @@ def _subgroup_index(group_id: str):
 WEIGHTS = {
     "S1_mode_switch": 5,
     "S2_tutor_gap":   3,    # per excess hour beyond 2h gap
-    "S3_long_block":  4,    # per excess hour beyond 4h consecutive
+    "S3_long_block":  4,    # per excess hour beyond 3h consecutive
     "S4_short_day":   2,    # per group/day with only 1-2 hours on campus
     "S5_online_day":  6,    # per misplaced online class
+    "S_UTIL":         2,    # room utilisation < 60%
+    "S_FIRSTLAST":    2,    # group starts in first or last slot window
+    "S_END17":        3,    # class ends after 17:00 on Mon-Thu
 }
 
 
@@ -156,6 +163,7 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
     # Cache lookups
     rooms = {r.id: r for r in universe.rooms}
     tutors = {t.id: t for t in universe.tutors}
+    _act_map = {act.id: act for c in universe.courses for act in c.activities}
 
     a = timetable.assignments
 
@@ -202,20 +210,22 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
     courses_by_code = {c.code: c for c in universe.courses}
     for i in range(len(a)):
         for j in range(i + 1, len(a)):
-            ci = _cohort_of(a[i], courses_by_code)
-            cj = _cohort_of(a[j], courses_by_code)
-            if ci != cj:
+            ci_set = _all_cohorts_of(a[i], courses_by_code)
+            cj_set = _all_cohorts_of(a[j], courses_by_code)
+            shared = ci_set & cj_set
+            if not shared:
                 continue
             if not _slots_overlap(a[i], a[j]) or not _weeks_overlap(a[i], a[j]):
                 continue
             si = _subgroup_index(a[i].group_id)
             sj = _subgroup_index(a[j].group_id)
-            # If either is the "All" lecture cohort, every student clashes.
+            # If either is the "All"/COMMON lecture cohort, every student clashes.
             # If both are sub-groups, only same-index sub-groups share students.
             if si is None or sj is None or si == sj:
                 # don't double-report what H3 already flagged
                 if a[i].group_id == a[j].group_id:
                     continue
+                ci = next(iter(shared))  # representative cohort for message
                 report.hard.append(Violation(
                     code="H8", severity="hard",
                     message=f"Cohort clash ({ci}): {a[i].activity_id} and "
@@ -264,6 +274,15 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
                 affected=[x.activity_id],
             ))
 
+    # H_SAT: no classes on Saturday
+    for x in a:
+        if x.day == 'Sat':
+            report.hard.append(Violation(
+                code="H_SAT", severity="hard",
+                message=f"{x.activity_id} is scheduled on Saturday",
+                affected=[x.activity_id],
+            ))
+
     # ------------------------------------------------------------------
     # HARD time-window rules (A1/A2/A3, Fri windows)
     from .data_loader import DAY_START_HOUR
@@ -279,6 +298,7 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
     for x in a:
         start = x.start_index
         end = x.start_index + x.duration_slots
+        _evening = getattr(_act_map.get(x.activity_id), 'is_evening', False)
         # A1: No classes before 09:00
         if start < slot_09:
             report.hard.append(Violation(
@@ -286,22 +306,23 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
                 message=f"{x.activity_id} starts before 09:00 on {x.day}",
                 affected=[x.activity_id],
             ))
-        # Global end-by 18:00
-        if end > slot_18:
+        # Global end-by 18:00 — MSc evening activities (19:00-21:00) are exempt
+        if end > slot_18 and not _evening:
             report.hard.append(Violation(
                 code="H_TIME_END18", severity="hard",
                 message=f"{x.activity_id} ends after 18:00 on {x.day}",
                 affected=[x.activity_id],
             ))
-        # A2: Wed afternoon ban — no class overlapping/starting from 13:00
-        if x.day == 'Wed' and end > slot_13:
+        # A2: Wed afternoon ban — MSc evening activities (19:00-21:00) are exempt
+        if x.day == 'Wed' and end > slot_13 and not _evening:
             report.hard.append(Violation(
                 code="H_TIME_WED_PM", severity="hard",
                 message=f"{x.activity_id} overlaps Wed afternoon from 13:00",
                 affected=[x.activity_id],
             ))
         # Fri protected window 12:00-14:00 and no Fri classes after 17:00
-        if x.day == 'Fri':
+        # MSc evening activities (19:00-21:00) are exempt from both Fri rules
+        if x.day == 'Fri' and not _evening:
             if start in (slot_12, slot_12 + 1) or (start < slot_14 and end > slot_12):
                 report.hard.append(Violation(
                     code="H_TIME_FRI_WINDOW", severity="hard",
@@ -443,6 +464,50 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
                 affected=[x.activity_id for x in items if x.delivery_mode == "f2f"],
             ))
 
+    # S_UTIL — prefer room utilisation ≥ 60%
+    for x in a:
+        room = rooms.get(x.room_id)
+        if not room or room.is_virtual or room.capacity == 0:
+            continue
+        util = x.size / room.capacity
+        if util < 0.6:
+            report.soft.append(Violation(
+                code="S_UTIL", severity="soft",
+                weight=WEIGHTS["S_UTIL"],
+                message=f"{x.activity_id} uses room {room.id} at {util:.0%} utilisation (below 60%)",
+                affected=[x.activity_id],
+            ))
+
+    # S_FIRSTLAST — avoid scheduling groups in the very first or last slot window
+    for x in a:
+        if x.start_index == slot_09:
+            report.soft.append(Violation(
+                code="S_FIRSTLAST", severity="soft",
+                weight=WEIGHTS["S_FIRSTLAST"],
+                message=f"{x.activity_id} starts in first slot of day (09:00)",
+                affected=[x.activity_id],
+            ))
+        if x.start_index >= slot_17:
+            report.soft.append(Violation(
+                code="S_FIRSTLAST", severity="soft",
+                weight=WEIGHTS["S_FIRSTLAST"],
+                message=f"{x.activity_id} starts at or after 17:00 (last slot window)",
+                affected=[x.activity_id],
+            ))
+
+    # S_END17 — prefer classes end by 17:00 on Mon-Thu (Fri already has a hard limit)
+    for x in a:
+        _evening = getattr(_act_map.get(x.activity_id), 'is_evening', False)
+        if _evening:
+            continue
+        if x.day != 'Fri' and x.start_index + x.duration_slots > slot_17:
+            report.soft.append(Violation(
+                code="S_END17", severity="soft",
+                weight=WEIGHTS["S_END17"],
+                message=f"{x.activity_id} ends after 17:00 on {x.day}",
+                affected=[x.activity_id],
+            ))
+
     # S5 — online classes for a programme should all sit on Mon or Tue
     online_days_by_prog: dict[str, set[str]] = defaultdict(set)
     online_per_prog: dict[str, list[Assignment]] = defaultdict(list)
@@ -477,8 +542,8 @@ def check(timetable: Timetable, universe: Universe) -> ViolationReport:
 def _flag_long_run(report: ViolationReport, gid: str, day: str,
                    start: int, end: int, acts: list[str]):
     hours = (end - start) * 0.5
-    if hours > 4:
-        excess = hours - 4
+    if hours > 3:
+        excess = hours - 3
         report.soft.append(Violation(
             code="S3", severity="soft",
             weight=int(WEIGHTS["S3_long_block"] * excess * 2),

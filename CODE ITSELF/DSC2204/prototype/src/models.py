@@ -148,8 +148,21 @@ class Activity:
     fixed_day: Optional[str] = None       # if scheduling is hard-pinned
     fixed_start_index: Optional[int] = None
     fixed_room_id: Optional[str] = None   # if a specific venue is required
+    room_count: int = 1                   # number of rooms needed simultaneously
+    is_evening: bool = False              # True → MSc/evening; 18:00 end constraint relaxed
     notes: str = ""
     co_tutor_ids: List[str] = field(default_factory=list)  # co-teachers (Staff 2, ...)
+    weeks_from_default: bool = False     # True when Teaching Weeks cell was blank
+    room_type_req: Optional[str] = None  # required room type from remarks, e.g. "seminar_room"
+    room_cap_req: Optional[int] = None   # minimum seat count required from remarks
+    # Per-week (day, start_slot_index) set by remarks for multi-date activities.
+    # Populated when different weeks need different days/times (e.g. "13 Oct Mon, 27 Oct Tue").
+    # Pre-solve, the solver splits these into separate single-week activities.
+    week_pins: Dict[int, tuple] = field(default_factory=dict)
+    # Common-module cohorts: additional "PROG/Y{year}" labels beyond the primary
+    # course programme.  Set by _apply_common_modules() so the solver and checker
+    # extend clash detection to every participating cohort.
+    shared_cohorts: List[str] = field(default_factory=list)
 
     @property
     def id(self) -> str:
@@ -206,6 +219,10 @@ class Assignment:
     size: int
     co_tutor_ids: List[str] = field(default_factory=list)
     co_tutor_names: List[str] = field(default_factory=list)
+    room2_id: str = ""
+    room2_name: str = ""
+    notes: str = ""
+    shared_cohorts: List[str] = field(default_factory=list)
 
 
 @dataclass

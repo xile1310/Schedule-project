@@ -716,9 +716,13 @@ def load_from_inputs(path: str) -> Universe:
         rtype_str = str(r[2] or "other").strip().lower()
         type_map = {
             "lecture_theatre": RoomType.LECTURE_THEATRE,
+            "lectorial":       RoomType.LECTURE_THEATRE,
+            "auditorium":      RoomType.LECTURE_THEATRE,
             "seminar_room":    RoomType.SEMINAR_ROOM,
+            "seminar room":    RoomType.SEMINAR_ROOM,
             "laboratory":      RoomType.LABORATORY,
             "computer_lab":    RoomType.COMPUTER_LAB,
+            "computer room":   RoomType.COMPUTER_LAB,
             "virtual":         RoomType.VIRTUAL,
             "other":           RoomType.OTHER,
         }
@@ -1088,10 +1092,12 @@ def load_from_worksheet(worksheet_path: str,
             cur_code = code
         if activity is None:        # module listed without activity data — skip
             continue
+        evening = bool(_g("start at 7pm?"))
         raw.append(dict(prog=cur_prog, size=cur_size, code=cur_code,
                         activity=activity, mode=mode, weeks=weeks,
                         row_staff=row_staff,
-                        remarks=remarks, subgroups=subgroups))
+                        remarks=remarks, subgroups=subgroups,
+                        evening=evening))
 
     # ---- aggregate identical (code, activity, mode) across week rows ----
     #
@@ -1120,15 +1126,23 @@ def load_from_worksheet(worksheet_path: str,
             code=r["code"], size=r["size"] or 0, prog=r["prog"],
             atype=atype, mode=mode, weeks=set(),
             remarks=r["remarks"], subgroups=r.get("subgroups"),
-            rows=[],
+            rows=[], is_evening=False,
             raw_weeks_cell=r["weeks"],   # preserved for day+time pin extraction
+            _has_empty_weeks=False,      # set True when any row's Teaching Weeks cell is blank
+            _has_explicit_weeks=False,   # set True when any row has explicit week values
         ))
         row_weeks = set(_parse_weeks_range(r["weeks"], _sem_start))
+        if r["weeks"] is None or str(r["weeks"]).strip() == "":
+            slot["_has_empty_weeks"] = True
+        else:
+            slot["_has_explicit_weeks"] = True
         slot["weeks"].update(row_weeks)
         slot["rows"].append({
             "staff": list(r.get("row_staff") or []),
             "weeks": row_weeks,
         })
+        if r.get("evening"):
+            slot["is_evening"] = True
         if r["size"]:
             slot["size"] = r["size"]
         if r.get("subgroups") not in (None, "") and slot.get("subgroups") in (None, ""):
@@ -1170,6 +1184,7 @@ def load_from_worksheet(worksheet_path: str,
 
         all_weeks = sorted(slot["weeks"])
         duration = _default_duration(atype)
+        is_evening = bool(slot.get("is_evening", False))
         if ignore_remarks:
             fday, fstart = None, None
         else:
@@ -1262,7 +1277,9 @@ def load_from_worksheet(worksheet_path: str,
                     duration_slots=duration, weeks=all_weeks,
                     tutor_id=t_id, group_id=gid, size=gsize,
                     fixed_day=pin_day, fixed_start_index=pin_start,
-                    notes=str(slot["remarks"] or ""), co_tutor_ids=[]))
+                    is_evening=is_evening,
+                    notes=str(slot["remarks"] or ""), co_tutor_ids=[],
+                    weeks_from_default=slot.get("_has_empty_weeks", False) and not slot.get("_has_explicit_weeks", False)))
         elif any_named_staff:
             # Per-row emission preserves week-split (DSC1001 lecture pattern,
             # DSC1001 tutorial pattern).  Each row gets ONE activity per
@@ -1285,12 +1302,17 @@ def load_from_worksheet(worksheet_path: str,
                         seen_groups.add(gid)
                     t_id, t_nm = _tutor_for(0)
                     tutors_by_id.setdefault(t_id, Tutor(id=t_id, name=t_nm))
+                    _co_pairs = row_pairs[1:]
+                    for _c_id, _c_nm in _co_pairs:
+                        tutors_by_id.setdefault(_c_id, Tutor(id=_c_id, name=_c_nm))
                     course.activities.append(Activity(
                         course_code=code, activity_type=atype, delivery_mode=mode,
                         duration_slots=duration, weeks=wk,
                         tutor_id=t_id, group_id=gid, size=size,
                         fixed_day=fday, fixed_start_index=fstart,
-                        notes=str(slot["remarks"] or ""), co_tutor_ids=[]))
+                        is_evening=is_evening,
+                        notes=str(slot["remarks"] or ""), co_tutor_ids=[p[0] for p in _co_pairs],
+                        weeks_from_default=slot.get("_has_empty_weeks", False) and not slot.get("_has_explicit_weeks", False)))
                 else:
                     prefix = ("G" if atype in (ActivityType.LECTURE, ActivityType.OTHER)
                               else _group_prefix(atype))
@@ -1308,7 +1330,9 @@ def load_from_worksheet(worksheet_path: str,
                             duration_slots=duration, weeks=wk,
                             tutor_id=t_id, group_id=gid, size=gsize,
                             fixed_day=pin_day, fixed_start_index=pin_start,
-                            notes=str(slot["remarks"] or ""), co_tutor_ids=[]))
+                            is_evening=is_evening,
+                            notes=str(slot["remarks"] or ""), co_tutor_ids=[],
+                            weeks_from_default=slot.get("_has_empty_weeks", False) and not slot.get("_has_explicit_weeks", False)))
         else:
             # NO planner-named staff anywhere — fall back to Eligibility list,
             # then the roster, then TBD.  This branch handles the auto-assign
@@ -1342,7 +1366,9 @@ def load_from_worksheet(worksheet_path: str,
                         duration_slots=duration, weeks=wk,
                         tutor_id=tid, group_id=gid, size=size,
                         fixed_day=fday, fixed_start_index=fstart,
-                        notes=str(slot["remarks"] or ""), co_tutor_ids=[]))
+                        is_evening=is_evening,
+                        notes=str(slot["remarks"] or ""), co_tutor_ids=[],
+                        weeks_from_default=slot.get("_has_empty_weeks", False) and not slot.get("_has_explicit_weeks", False)))
                 else:
                     prefix = ("G" if atype in (ActivityType.LECTURE, ActivityType.OTHER)
                               else _group_prefix(atype))
@@ -1358,7 +1384,9 @@ def load_from_worksheet(worksheet_path: str,
                             duration_slots=duration, weeks=wk,
                             tutor_id=tid, group_id=gid, size=gsize,
                             fixed_day=pin_day, fixed_start_index=pin_start,
-                            notes=str(slot["remarks"] or ""), co_tutor_ids=[]))
+                            is_evening=is_evening,
+                            notes=str(slot["remarks"] or ""), co_tutor_ids=[],
+                            weeks_from_default=slot.get("_has_empty_weeks", False) and not slot.get("_has_explicit_weeks", False)))
 
     # ---- rooms + calendar -----------------------------------------------
     # Rooms MUST live in the worksheet's own 'Rooms' tab.  We refuse to
@@ -1404,6 +1432,15 @@ def load_from_worksheet(worksheet_path: str,
             print("  - " + _w, file=_sys.stderr)
 
     courses = sorted(by_code.values(), key=lambda c: (c.year, c.code))
+
+    # If any activity is marked as evening (column M ticked), the Settings tab's
+    # "Day end hour" may be 18:00 which is too early for a 19:00 start.
+    # Extend the day to 22:00 automatically so the slot grid fits evening classes.
+    global DAY_END_HOUR
+    has_evening = any(a.is_evening for c in courses for a in c.activities)
+    if has_evening and DAY_END_HOUR < 22:
+        DAY_END_HOUR = 22
+
     return Universe(
         courses=courses, rooms=rooms,
         tutors=sorted(tutors_by_id.values(), key=lambda t: t.name),

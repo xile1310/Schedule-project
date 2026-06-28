@@ -46,16 +46,37 @@ from .models import (
 # ---------------------------------------------------------------------------
 
 def feasible_rooms(activity: Activity, universe: Universe) -> List[Room]:
-    """All rooms an activity may legally occupy."""
-    # Hard venue pin from a remark takes priority over all other constraints.
+    """All rooms an activity may legally occupy.
+
+    Priority order:
+      1. fixed_room_id pin (specific named room from remarks)
+      2. room_type_req + room_cap_req  (room characteristic requirement from remarks)
+         → primary: rooms of correct type with capacity ≥ max(room_cap_req, activity.size)
+         → fallback: any physical room with capacity ≥ max(room_cap_req, activity.size)
+           (type preference relaxed; capacity minimum is never relaxed)
+      3. Default activity-type-based filtering (Lecture→LT, Lab→lab/CL, Tutorial→SR/lab)
+    """
     if getattr(activity, "fixed_room_id", None):
         pinned = [r for r in universe.rooms if r.id == activity.fixed_room_id]
         if pinned:
             return pinned
 
-    rooms: list[Room] = []
-    atype = activity.activity_type.value
     mode = activity.delivery_mode.value
+    atype = activity.activity_type.value
+    room_type_req = getattr(activity, "room_type_req", None)
+    room_cap_req = getattr(activity, "room_cap_req", None)
+    min_cap = max(room_cap_req or 0, activity.size)
+
+    _type_map = {
+        "seminar_room":    RoomType.SEMINAR_ROOM,
+        "computer_lab":    RoomType.COMPUTER_LAB,
+        "laboratory":      RoomType.LABORATORY,
+        "lecture_theatre": RoomType.LECTURE_THEATRE,
+        "other":           RoomType.OTHER,
+    }
+    req_type = _type_map.get(room_type_req) if room_type_req else None
+
+    rooms: list[Room] = []
     for r in universe.rooms:
         if mode in ("online_sync", "online_async"):
             if r.is_virtual:
@@ -63,19 +84,32 @@ def feasible_rooms(activity: Activity, universe: Universe) -> List[Room]:
             continue
         if r.is_virtual:
             continue
-        if r.capacity < activity.size:
+        if r.capacity < min_cap:
             continue
-        if atype == "Lecture":
-            if r.room_type != RoomType.LECTURE_THEATRE:
-                continue
+        if req_type is not None:
+            if r.room_type == req_type:
+                rooms.append(r)
+        elif atype == "Lecture":
+            if r.room_type == RoomType.LECTURE_THEATRE:
+                rooms.append(r)
         elif atype == "Laboratory":
-            if r.room_type not in (RoomType.LABORATORY, RoomType.COMPUTER_LAB):
-                continue
+            if r.room_type in (RoomType.LABORATORY, RoomType.COMPUTER_LAB):
+                rooms.append(r)
         elif atype in ("Tutorial", "Seminar"):
-            if r.room_type not in (RoomType.SEMINAR_ROOM, RoomType.LABORATORY):
+            if r.room_type in (RoomType.SEMINAR_ROOM, RoomType.LABORATORY):
+                rooms.append(r)
+        else:
+            rooms.append(r)
+
+    # Fallback: required room type had no matches → any physical room ≥ min_cap.
+    # Capacity floor is never relaxed; only the type preference is.
+    if req_type is not None and not rooms:
+        for r in universe.rooms:
+            if r.is_virtual or mode in ("online_sync", "online_async"):
                 continue
-        # Workshops / quizzes / others accept any sufficiently-large room
-        rooms.append(r)
+            if r.capacity >= min_cap:
+                rooms.append(r)
+
     return rooms
 
 
@@ -108,11 +142,53 @@ def build_assignment(activity: Activity, day: str, start: int,
         size=activity.size,
         co_tutor_ids=list(activity.co_tutor_ids),
         co_tutor_names=[tutor_names.get(t, t) for t in activity.co_tutor_ids],
+        notes=getattr(activity, "notes", ""),
+        shared_cohorts=list(getattr(activity, "shared_cohorts", [])),
     )
 
 
 # Backwards-compatible alias (the heuristic imports this name)
 _build_assignment = build_assignment
+
+
+# ---------------------------------------------------------------------------
+# Post-solve: assign secondary rooms for activities with room_count > 1
+# ---------------------------------------------------------------------------
+
+def assign_secondary_rooms(timetable: "Timetable", universe: Universe,
+                           act_by_id: dict) -> None:
+    """Mutate assignments in place: find a second compatible room for any
+    activity whose room_count > 1 (e.g. a remark said '2 rooms').
+
+    The secondary room must be compatible (capacity, mode) and not already
+    booked at the same day/time/weeks combination.
+    """
+    # Build a quick-lookup of what's already booked: (room_id, day, slot) -> set[week]
+    booked: dict = defaultdict(set)
+    for asn in timetable.assignments:
+        for sl in range(asn.start_index, asn.start_index + asn.duration_slots):
+            booked[(asn.room_id, asn.day, sl)].update(asn.weeks)
+
+    for asn in timetable.assignments:
+        act = act_by_id.get(asn.activity_id)
+        if not act or getattr(act, "room_count", 1) <= 1:
+            continue
+        # Candidates: same eligibility rules, not the primary room, not virtual
+        candidates = [r for r in feasible_rooms(act, universe)
+                      if r.id != asn.room_id and not r.is_virtual]
+        for room in candidates:
+            clash = False
+            for sl in range(asn.start_index, asn.start_index + asn.duration_slots):
+                if booked.get((room.id, asn.day, sl), set()) & set(asn.weeks):
+                    clash = True
+                    break
+            if not clash:
+                asn.room2_id = room.id
+                asn.room2_name = room.name
+                # Mark secondary room as booked so it isn't double-used
+                for sl in range(asn.start_index, asn.start_index + asn.duration_slots):
+                    booked[(room.id, asn.day, sl)].update(asn.weeks)
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -169,13 +245,14 @@ def solve(universe: Universe, time_limit_s: int = 60,
             raise RuntimeError(f"No feasible rooms for {a.id} (size={a.size}, mode={a.delivery_mode.value})")
         rooms_for[a.id] = feas
         day_var[a.id] = model.NewIntVar(0, n_days - 1, f"day_{a.id}")
-        from .data_loader import canonical_starts as _canon
-        # An explicit pin in Remarks wins over the canonical period block —
-        # if pinned, the start domain is just that single value.
+        # All activities get full start-slot freedom in the hard model.
+        # Restricting to canonical periods (09:00/12:00/14:00/16:00) causes a
+        # pigeonhole infeasibility for cohorts that have ≥15 mutually-exclusive
+        # activities — canonical starts are instead encouraged via soft constraints.
         if a.fixed_start_index is not None:
             _domain = [a.fixed_start_index]
         else:
-            _domain = _canon(a.duration_slots) or list(range(0, n_slots - a.duration_slots + 1))
+            _domain = list(range(0, n_slots - a.duration_slots + 1))
         start_var[a.id] = model.NewIntVarFromDomain(
             cp_model.Domain.FromValues(_domain), f"start_{a.id}")
         room_var[a.id] = model.NewIntVarFromDomain(
@@ -201,18 +278,25 @@ def solve(universe: Universe, time_limit_s: int = 60,
         # Enforce earliest start at 09:00
         model.Add(start_var[a.id] >= slot_09)
 
-        # Enforce no activity ends after 18:00 (global)
-        model.Add(start_var[a.id] + a.duration_slots <= slot_18)
+        # MSc/evening activities (column M ticked) are exempt from the 18:00 cutoff.
+        # They still end before day-end (n_slots). All other activities end by 18:00.
+        _evening = a.is_evening
+        if _evening:
+            model.Add(start_var[a.id] + a.duration_slots <= n_slots)
+        else:
+            model.Add(start_var[a.id] + a.duration_slots <= slot_18)
 
         # Wednesday: no classes in the afternoon starting/overlapping from 13:00
-        if "Wed" in days:
+        # Evening (MSc) activities are exempt — they start at 19:00, well past 13:00.
+        if not _evening and "Wed" in days:
             is_wed = model.NewBoolVar(f"is_wed_{a.id}")
             model.Add(day_var[a.id] == days.index("Wed")).OnlyEnforceIf(is_wed)
             model.Add(day_var[a.id] != days.index("Wed")).OnlyEnforceIf(is_wed.Not())
             model.Add(start_var[a.id] + a.duration_slots <= slot_13).OnlyEnforceIf(is_wed)
 
         # Friday protected window 12:00-14:00 and stricter end-by-17:00
-        if "Fri" in days:
+        # Evening (MSc) activities are exempt — 19:00-21:00 is outside both windows.
+        if not _evening and "Fri" in days:
             is_fri = model.NewBoolVar(f"is_fri_{a.id}")
             model.Add(day_var[a.id] == days.index("Fri")).OnlyEnforceIf(is_fri)
             model.Add(day_var[a.id] != days.index("Fri")).OnlyEnforceIf(is_fri.Not())
@@ -264,82 +348,18 @@ def solve(universe: Universe, time_limit_s: int = 60,
                             [day_var[a.id], start_var[a.id]], forbidden
                         )
 
-    # Flexible lunch gap -------------------------------------------------------
-    # Each tutor and each student cohort-subgroup must have at least one free
-    # consecutive 1-hour (2-slot) window within 11:00–14:00 on every day.
-    from .data_loader import DAY_START_HOUR as _DSH
-    import re as _re2
-    _sl = lambda hh: (hh - _DSH) * 2
-    LUNCH_START = _sl(11)
-    LUNCH_END   = _sl(14)
-    LUNCH_PAIRS = list(range(LUNCH_START, LUNCH_END - 1))
-
-    def _add_lunch_gap(label: str, act_ids: list) -> None:
-        safe = _re2.sub(r"[^a-zA-Z0-9]", "_", label)
-        for di in range(n_days):
-            on_day = {}
-            for aid in act_ids:
-                b = model.NewBoolVar(f"od_{safe}_{aid}_{di}")
-                model.Add(day_var[aid] == di).OnlyEnforceIf(b)
-                model.Add(day_var[aid] != di).OnlyEnforceIf(b.Not())
-                on_day[aid] = b
-            pair_free_vars = []
-            for p in LUNCH_PAIRS:
-                pf = model.NewBoolVar(f"lpf_{safe}_{di}_{p}")
-                for aid in act_ids:
-                    dur = by_id[aid].duration_slots
-                    bs = max(0, p + 1 - dur + 1)   # earliest start that covers p or p+1
-                    be = p + 1                       # latest start that covers p or p+1
-                    if bs > be:
-                        continue
-                    # Build domain: valid starts OUTSIDE the blocking range [bs, be]
-                    intervals = []
-                    if bs > 0:
-                        intervals.append([0, bs - 1])
-                    if be < n_slots - 1:
-                        intervals.append([be + 1, n_slots - 1])
-                    start_ok = model.NewBoolVar(f"sok_{safe}_{aid}_{di}_{p}")
-                    if intervals:
-                        dom_ok = cp_model.Domain.FromIntervals(intervals)
-                        model.AddLinearExpressionInDomain(
-                            start_var[aid], dom_ok).OnlyEnforceIf(start_ok)
-                    else:
-                        model.Add(start_ok == 0)  # activity always blocks this pair
-                    # pf = 1 and activity is on this day → start must be outside blocking range
-                    model.AddBoolOr([pf.Not(), on_day[aid].Not(), start_ok])
-                pair_free_vars.append(pf)
-            if pair_free_vars:
-                model.AddBoolOr(pair_free_vars)
-
-    # Apply per tutor
-    for tid, t_aids in by_tutor.items():
-        if t_aids:
-            _add_lunch_gap(f"t_{tid}", t_aids)
-
-    # Apply per cohort-subgroup
-    coh_sub_acts: dict[tuple, list] = defaultdict(list)
+    # Build tutor/group activity maps early — needed by lunch gap AND H1/H2/H3.
+    by_tutor: dict[str, list[str]] = defaultdict(list)
+    by_group: dict[str, list[str]] = defaultdict(list)
     for a in activities:
-        coh = cohort_of[a.id]
-        si  = subidx_of[a.id]
-        coh_sub_acts[(coh, si)].append(a.id)
+        for _t in {a.tutor_id, *a.co_tutor_ids}:
+            by_tutor[_t].append(a.id)
+        by_group[a.group_id].append(a.id)
 
-    coh_numbered: dict[str, set] = defaultdict(set)
-    for a in activities:
-        si = subidx_of[a.id]
-        if si is not None:
-            coh_numbered[cohort_of[a.id]].add(si)
-
-    for coh, numbered in coh_numbered.items():
-        all_ids = coh_sub_acts.get((coh, None), [])
-        for k in numbered:
-            combined = list(set(all_ids) | set(coh_sub_acts.get((coh, k), [])))
-            if combined:
-                _add_lunch_gap(f"coh_{coh}_{k}", combined)
-
-    for coh, sub_acts_list in coh_sub_acts.items():
-        c_label, si = coh
-        if si is None and c_label not in coh_numbered:
-            _add_lunch_gap(f"coh_{c_label}", sub_acts_list)
+    # H7 (lunch gap) is enforced by the heuristic solver week-by-week.
+    # CP-SAT cannot model it correctly because day_var is week-agnostic:
+    # a Quiz in week 6 and a Lecture running weeks 1-13 both appear "on Tuesday"
+    # simultaneously, making the constraint spuriously infeasible.
 
     # Resource exclusion helper
     virtual_idxs = {room_index[r.id] for r in universe.rooms if r.is_virtual}
@@ -385,13 +405,6 @@ def solve(universe: Universe, time_limit_s: int = 60,
             ])
 
     # H1 + H2 + H3
-    by_tutor: dict[str, list[str]] = defaultdict(list)
-    by_group: dict[str, list[str]] = defaultdict(list)
-    for a in activities:
-        for _t in {a.tutor_id, *a.co_tutor_ids}:
-            by_tutor[_t].append(a.id)
-        by_group[a.group_id].append(a.id)
-
     ids = [a.id for a in activities]
     for i in range(len(ids)):
         wi = set(by_id[ids[i]].weeks)
@@ -402,12 +415,13 @@ def solve(universe: Universe, time_limit_s: int = 60,
                 continue   # H6: distinct weeks → no conflict possible
             share_tutor = by_id[ai].tutor_id == by_id[aj].tutor_id
             share_group = by_id[ai].group_id == by_id[aj].group_id
-            # H8 cohort clash: same year of same programme, and either
-            # contains everyone (subgroup=None) or both share subgroup index.
-            ci, cj = cohort_of[ai], cohort_of[aj]
+            # H8 cohort clash: same year of same programme (or shared via common module),
+            # and either contains everyone (subgroup=None) or both share subgroup index.
+            ci_set = {cohort_of[ai]} | set(getattr(by_id[ai], 'shared_cohorts', []))
+            cj_set = {cohort_of[aj]} | set(getattr(by_id[aj], 'shared_cohorts', []))
             si, sj = subidx_of[ai], subidx_of[aj]
             share_cohort = (
-                ci == cj
+                bool(ci_set & cj_set)
                 and (si is None or sj is None or si == sj)
             )
             # If they already share group_id, H3 handles it — no need to duplicate.
@@ -437,7 +451,7 @@ def solve(universe: Universe, time_limit_s: int = 60,
                     model.Add(day_var[aid] != d).OnlyEnforceIf(on_day.Not())
                     load.append(on_day * by_id[aid].duration_slots)
                 excess = model.NewIntVar(0, n_slots, f"ex_{tid}_{d}")
-                model.Add(excess >= sum(load) - 8)
+                model.Add(excess >= sum(load) - 6)  # penalise >3h/day per tutor
                 soft_terms.append(2 * excess)
 
         for gid, gids in by_group.items():
@@ -450,8 +464,60 @@ def solve(universe: Universe, time_limit_s: int = 60,
                     model.Add(day_var[aid] != d).OnlyEnforceIf(on_day.Not())
                     load.append(on_day * by_id[aid].duration_slots)
                 excess = model.NewIntVar(0, n_slots, f"exg_{gid}_{d}")
-                model.Add(excess >= sum(load) - 8)
+                model.Add(excess >= sum(load) - 6)  # penalise >3h/day per group (S3)
                 soft_terms.append(2 * excess)
+
+        # S_UTIL: prefer room utilisation >= 60%
+        room_list = universe.rooms
+        for a in activities:
+            for r in rooms_for[a.id]:
+                if r.is_virtual or r.capacity == 0:
+                    continue
+                util = a.size / r.capacity
+                if util < 0.6:
+                    b = model.NewBoolVar(f"sutil_{a.id}_{r.id}")
+                    model.Add(room_var[a.id] == room_index[r.id]).OnlyEnforceIf(b)
+                    model.Add(room_var[a.id] != room_index[r.id]).OnlyEnforceIf(b.Not())
+                    penalty = max(1, round((0.6 - util) * 10))
+                    soft_terms.append(penalty * b)
+
+        # S_FIRSTLAST: avoid first/last slot of day for groups
+        for a in activities:
+            b_first = model.NewBoolVar(f"sfirst_{a.id}")
+            model.Add(start_var[a.id] == slot_09).OnlyEnforceIf(b_first)
+            model.Add(start_var[a.id] != slot_09).OnlyEnforceIf(b_first.Not())
+            soft_terms.append(2 * b_first)
+            if not a.is_evening:
+                b_last = model.NewBoolVar(f"slast_{a.id}")
+                model.Add(start_var[a.id] >= slot_17).OnlyEnforceIf(b_last)
+                model.Add(start_var[a.id] < slot_17).OnlyEnforceIf(b_last.Not())
+                soft_terms.append(2 * b_last)
+
+        # S_END17: prefer end by 17:00 on Mon-Thu (Fri already hard-constrained)
+        for a in activities:
+            if a.is_evening:
+                continue
+            ends_late = model.NewBoolVar(f"end17_{a.id}")
+            model.Add(start_var[a.id] + a.duration_slots > slot_17).OnlyEnforceIf(ends_late)
+            model.Add(start_var[a.id] + a.duration_slots <= slot_17).OnlyEnforceIf(ends_late.Not())
+            soft_terms.append(3 * ends_late)
+
+        # S_CANON: prefer canonical SIT period starts (09:00/12:00/14:00/16:00).
+        # The hard model allows any slot (to avoid pigeonhole infeasibility);
+        # this soft term steers the solver back toward the standard periods.
+        from .data_loader import canonical_starts as _canon_soft
+        for a in activities:
+            if a.fixed_start_index is not None or a.is_evening:
+                continue
+            canon = _canon_soft(a.duration_slots)
+            if not canon:
+                continue
+            off_canon = model.NewBoolVar(f"soff_{a.id}")
+            model.AddLinearExpressionInDomain(
+                start_var[a.id],
+                cp_model.Domain.FromValues(canon),
+            ).OnlyEnforceIf(off_canon.Not())
+            soft_terms.append(4 * off_canon)
 
     if soft_terms:
         model.Minimize(sum(soft_terms))
@@ -473,13 +539,15 @@ def solve(universe: Universe, time_limit_s: int = 60,
         r = rooms_by_idx[solver.Value(room_var[a.id])]
         assigns.append(build_assignment(a, d, s, r, tutor_name))
 
-    return Timetable(
+    timetable = Timetable(
         assignments=assigns,
         metadata={
             "solver": "ortools.cp_sat",
             "status": solver.StatusName(status),
         },
     )
+    assign_secondary_rooms(timetable, universe, by_id)
+    return timetable
 
 
 # --- end of solver_cpsat.py ---

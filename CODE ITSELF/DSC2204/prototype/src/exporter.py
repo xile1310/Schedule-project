@@ -50,7 +50,8 @@ def write_dashboard(timetable: Timetable, report: ViolationReport,
         "tutors": [{"id": t.id, "name": t.name} for t in universe.tutors],
         "groups": [{"id": g.id, "label": g.label, "size": g.size,
                     "course": g.course_code} for g in universe.groups],
-        "courses": [{"code": c.code, "year": c.year} for c in universe.courses],
+        "courses": [{"code": c.code, "year": c.year, "programme": c.programme}
+                    for c in universe.courses],
         "days": DAYS,
         "slot_min": SLOT_MIN,
         "day_start_hour": DAY_START_HOUR,
@@ -204,9 +205,10 @@ function init() {{
 }}
 
 const COURSE_YEAR = Object.fromEntries(DATA.courses.map(c => [c.code, c.year]));
+const COURSE_PROG = Object.fromEntries(DATA.courses.map(c => [c.code, c.programme || c.code.slice(0,3)]));
 
 function uniqueValues(mode) {{
-  if (mode === 'programme') return [...new Set(DATA.assignments.map(a => a.course_code.slice(0,3)))].sort();
+  if (mode === 'programme') return [...new Set(DATA.assignments.map(a => COURSE_PROG[a.course_code] || a.course_code.slice(0,3)))].sort();
   if (mode === 'year') {{
     const ys = [...new Set(DATA.assignments.map(a => COURSE_YEAR[a.course_code] || '?'))].sort();
     return ys.map(y => 'Year ' + y);
@@ -255,6 +257,8 @@ function renderControls() {{
       const o = document.createElement('option'); o.value=v; o.textContent=v; f.appendChild(o);
     }});
   }}
+  // Auto-select the first real option so the calendar immediately filters
+  if (f.options.length > 1) f.selectedIndex = 1;
   render();
 }}
 
@@ -264,7 +268,7 @@ function filterAssignments() {{
   const w = $('weekFilter').value;
   return DATA.assignments.filter(a => {{
     if (v !== '__all__') {{
-      if (mode==='programme' && a.course_code.slice(0,3) !== v) return false;
+      if (mode==='programme' && (COURSE_PROG[a.course_code] || a.course_code.slice(0,3)) !== v) return false;
       if (mode==='year'      && ('Year ' + (COURSE_YEAR[a.course_code]||'?')) !== v) return false;
       if (mode==='student') {{
         const m = v.match(/^Year (\S+) \u2014 sub-group (\d+)$/);
@@ -317,6 +321,16 @@ function render() {{
   // overlay events (positioned absolutely inside the cell)
   // Find each slot div by its index: header (1+5) + row*(1+5) + (1+dayIdx)
   const colCount = 6;
+
+  // Pre-group items by (day, start_index) so we can split overlapping events
+  // into side-by-side columns (like a real calendar app).
+  const overlapKey = a => a.day + '|' + a.start_index;
+  const overlapGroups = {{}};
+  items.forEach(a => {{
+    const k = overlapKey(a);
+    (overlapGroups[k] = overlapGroups[k] || []).push(a);
+  }});
+
   items.forEach(a => {{
     const dayIdx = DATA.days.indexOf(a.day);
     if (dayIdx < 0) return;
@@ -327,10 +341,25 @@ function render() {{
     const ev = document.createElement('div');
     ev.className = 'event ' + a.delivery_mode;
     ev.style.height = (a.duration_slots * 30 - 4) + 'px';
+
+    // Side-by-side layout when multiple events share the same start slot
+    const group = overlapGroups[overlapKey(a)];
+    const nCols = group.length;
+    const colIdx = group.indexOf(a);
+    if (nCols > 1) {{
+      const pct = 100 / nCols;
+      ev.style.left  = `calc(${{colIdx * pct}}% + 2px)`;
+      ev.style.right = `calc(${{(nCols - colIdx - 1) * pct}}% + 2px)`;
+      ev.style.top   = '0';
+    }}
+
+    const notesHtml = (a.notes && a.notes.trim())
+      ? `<div style="opacity:.75;font-style:italic;margin-top:2px">${{a.notes.trim()}}</div>` : '';
     ev.innerHTML = `<div class="when">${{a.start_label.slice(0,2)}}:${{a.start_label.slice(2)}} – ${{a.end_label.slice(0,2)}}:${{a.end_label.slice(2)}}</div>
       <div><b>${{a.course_code}}</b> ${{a.activity_type}}</div>
       <div>${{a.group_id.split('/').pop()}} · ${{a.tutor_name}}</div>
-      <div style="opacity:.85">${{a.room_id}}</div>`;
+      <div style="opacity:.85">${{a.room_id}}</div>
+      ${{notesHtml}}`;
     ev.title = JSON.stringify(a, null, 2);
     c.appendChild(ev);
   }});
@@ -397,7 +426,7 @@ def write_timetable_xlsx(timetable, universe, out_path):
     ws = wb.active
     ws.title = "Timetable"
     cols = ["Module", "Yr", "Activity", "Group", "Delivery Mode", "Day",
-            "Start", "End", "Weeks", "Room", "Tutor ID", "Tutor"]
+            "Start", "End", "Weeks", "Room", "Tutor ID", "Tutor", "Remarks"]
     for j, c in enumerate(cols, 1):
         cell = ws.cell(1, j, c)
         cell.font = hdr_font; cell.fill = hdr_fill
@@ -410,13 +439,14 @@ def write_timetable_xlsx(timetable, universe, out_path):
                 a.group_id.split("/")[-1], a.delivery_mode, a.day,
                 a.start_label, a.end_label, wkstr(a.weeks), a.room_id,
                 a.tutor_id,
-                (a.tutor_name + (" + " + ", ".join(a.co_tutor_names) if a.co_tutor_names else ""))]
+                (a.tutor_name + (" + " + ", ".join(a.co_tutor_names) if a.co_tutor_names else "")),
+                getattr(a, "notes", "")]
         for j, val in enumerate(vals, 1):
             cell = ws.cell(i, j, val); cell.border = border
     ws.freeze_panes = "A2"
     if rows:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(rows) + 1}"
-    for j, w in enumerate([10, 4, 11, 7, 14, 5, 7, 7, 24, 24, 10, 22], 1):
+    for j, w in enumerate([10, 4, 11, 7, 14, 5, 7, 7, 24, 24, 10, 22, 40], 1):
         ws.column_dimensions[get_column_letter(j)].width = w
 
     # ---- Sheet 2: who teaches what ----
@@ -679,17 +709,23 @@ def write_template2(timetable, universe, template_in, out_path,
         activity_hk = f"{sis_code}-{act_code}/{group_label}"
         duration_periods = int(round(a.duration_slots * 30 / 20))
         rec_mode = "A0" if str(a.delivery_mode).lower() == "f2f" else ""
-        room_hostkey = a.room_id if a.room_id and a.room_id.upper() != "VIRTUAL" else ""
+        room_hostkey = a.room_id if a.room_id else ""
+        room2_hostkey = a.room2_id if getattr(a, "room2_id", "") else ""
+        shared = getattr(a, "shared_cohorts", [])
+        if shared:
+            remark = "Combined: " + " + ".join(shared)
+        else:
+            remark = a.notes or ""
         co_tutor_name = a.co_tutor_names[0] if a.co_tutor_names else ""
         co_tutor_id = a.co_tutor_ids[0] if a.co_tutor_ids else ""
 
         ws.append([
             a.course_code, a.activity_type, tnum, group_label, a.day,
             a.start_label, a.end_label, a.size, sector, "",
-            room_hostkey, "", "", a.tutor_name, co_tutor_name,
-            weeks_str, rec_mode, "", first_week, activity_hk,
+            room_hostkey, room2_hostkey, "", a.tutor_name, co_tutor_name,
+            weeks_str, rec_mode, remark, first_week, activity_hk,
             sis_code, term, act_code, duration_periods, "",
-            a.tutor_id, co_tutor_id, sector, "", room_hostkey, "",
+            a.tutor_id, co_tutor_id, sector, "", room_hostkey, room2_hostkey,
         ])
 
     for r in range(2, ws.max_row + 1):
